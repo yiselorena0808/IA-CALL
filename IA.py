@@ -6,71 +6,110 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-PORT = int(os.getenv("PORT", os.getenv("PORT_CALLS", 5001)))
-DEBUG = os.getenv("FLASK_DEBUG", "True").lower() in ("true", "1", "t")
 
-@app.route("/voice", methods=['GET', 'POST'])
+# En local usa 5000. En Render usará PORT automáticamente.
+PORT = int(os.getenv("PORT", "5000"))
+DEBUG = os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1", "t")
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return "Servidor activo."
+
+
+@app.route("/voice", methods=["GET", "POST"])
 def voice():
-    """Ruta inicial cuando entra la llamada de voz"""
+    print("=== /voice ===")
+    print("Method:", request.method)
+    print("Values:", dict(request.values))
+
     response = VoiceResponse()
-    
-    # Mensaje de bienvenida de Taxi PDX
-    mensaje_bienvenida = "Hola, soy tu asistente virtual. ¿Desde dónde y hacia dónde necesitas viajar hoy?"
-    
-    # La etiqueta <Gather> escucha la respuesta de voz del usuario y la transcribe a texto
-    # language='es-ES' configura el reconocimiento en español, o 'en-US' si es inglés
-    gather = Gather(input='speech', action='/process_speech', language='es-ES', speechTimeout='auto')
-    
-    # voice='Polly.Mia' usa una voz neural realista de Amazon Polly disponible en Twilio
-    gather.say(mensaje_bienvenida, voice='Polly.Mia')
-    
+
+    # URL absoluta para que Twilio siempre sepa a dónde enviar el resultado de voz
+    process_url = request.url_root.rstrip("/") + "/process_speech"
+
+    gather = Gather(
+        input="speech",
+        action=process_url,
+        method="POST",
+        language="es-MX",
+        speech_timeout="auto",
+        timeout=5
+    )
+
+    gather.say(
+        "Hola, soy tu asistente virtual. Desde dónde y hacia dónde necesitas viajar hoy.",
+        voice="Polly.Mia"
+    )
+
     response.append(gather)
-    
-    # Si el usuario se queda en silencio y no dice nada
-    response.say("No hemos escuchado tu respuesta. Por favor llama de nuevo. Hasta luego.", voice='Polly.Mia')
+
+    response.say(
+        "No pude escucharte. Por favor vuelve a llamar o intenta de nuevo.",
+        voice="Polly.Mia"
+    )
     response.hangup()
-    
-    return str(response)
 
-@app.route("/process_speech", methods=['GET', 'POST'])
+    return str(response), 200, {"Content-Type": "text/xml"}
+
+
+@app.route("/process_speech", methods=["GET", "POST"])
 def process_speech():
-    """Ruta que procesa lo que el usuario dijo durante la llamada"""
+    print("=== /process_speech ===")
+    print("Method:", request.method)
+    print("Values:", dict(request.values))
+
     response = VoiceResponse()
-    
-    # Twilio nos envía la transcripción de voz en la variable 'SpeechResult'
-    if 'SpeechResult' in request.values:
-        texto_usuario = request.values['SpeechResult']
-        print(f"📞 El cliente dijo: {texto_usuario}")
-        
-        # Aquí se conecta la transcripción con tu IA (ej. ChatGPT/OpenAI) 
-        # para entender direcciones y generar una respuesta dinámica.
+    texto_usuario = request.values.get("SpeechResult", "").strip()
+
+    if texto_usuario:
+        print(f"Cliente dijo: {texto_usuario}")
+
         respuesta_ia = procesar_con_ia(texto_usuario)
-        
-        # Retornamos la respuesta hablada al usuario y volvemos a escuchar si es necesario
-        gather = Gather(input='speech', action='/process_speech', language='es-ES', speechTimeout='auto')
-        gather.say(respuesta_ia, voice='Polly.Mia')
+
+        process_url = request.url_root.rstrip("/") + "/process_speech"
+
+        gather = Gather(
+            input="speech",
+            action=process_url,
+            method="POST",
+            language="es-MX",
+            speech_timeout="auto",
+            timeout=5
+        )
+        gather.say(respuesta_ia, voice="Polly.Mia")
         response.append(gather)
+
+        response.say("No escuché más información. Hasta luego.", voice="Polly.Mia")
+        response.hangup()
     else:
-        # En caso de que falle el reconocimiento de voz
-        response.say("Disculpa, no te he entendido bien. Por favor, repite tu pedido.", voice='Polly.Mia')
-        response.redirect('/voice')
-        
-    return str(response)
+        response.say(
+            "Disculpa, no te entendí bien. Por favor repite tu dirección y destino.",
+            voice="Polly.Mia"
+        )
+        response.redirect("/voice", method="POST")
+
+    return str(response), 200, {"Content-Type": "text/xml"}
 
 
-def procesar_con_ia(texto):
+def procesar_con_ia(texto: str) -> str:
     """
-    Función simulada: Aquí conectarías a la API de OpenAI (ChatGPT) pasándole el texto
-    para que extraiga el origen, destino y genere la respuesta de forma natural.
+    Simulación de IA.
+    Luego aquí puedes conectar OpenAI para extraer origen y destino.
     """
     texto_min = texto.lower()
-    if any(word in texto_min for word in ["gracias", "eso es todo", "adiós", "no", "nada más"]):
-        return "Perfecto, un conductor de Taxi P D X estará contigo pronto. Gracias por preferirnos. Que tengas un excelente día."
-    elif len(texto_min) > 10:
-        return "Entendido. Procesando tu ruta con nuestro sistema. Enseguida te enviaremos un SMS o WhatsApp con los datos de tu conductor. ¿Deseas agregar algo más a tu pedido?"
-    else:
-        return "Por favor, indícame claramente la dirección exacta de recogida y tu destino dentro de la zona P D X."
+
+    if any(word in texto_min for word in [
+        "gracias", "eso es todo", "adiós", "adios", "no", "nada más", "nada mas"
+    ]):
+        return "Perfecto. Hemos recibido tu solicitud. Gracias por preferirnos. Que tengas un excelente día."
+
+    if len(texto_min) > 10:
+        return "Entendido. Estamos procesando tu ruta. Enseguida te enviaremos los datos del conductor. Deseas agregar algo más."
+
+    return "Por favor indícame claramente la dirección exacta de recogida y tu destino."
+
 
 if __name__ == "__main__":
-    print(f"☎️ Iniciando el servidor de recepción de llamadas (Taxi PDX) en el puerto {PORT}...")
-    app.run(host='0.0.0.0', port=PORT, debug=DEBUG)
+    print(f"Iniciando servidor en puerto {PORT}...")
+    app.run(host="0.0.0.0", port=PORT, debug=DEBUG)
