@@ -13,23 +13,19 @@ load_dotenv()
 app = Flask(__name__)
 
 PORT = int(os.getenv("PORT", "5000"))
-DEBUG = os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1", "t")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip()
 
 client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
 
-
 @app.route("/", methods=["GET"])
 def home():
     return "Servidor activo."
 
-
 @app.route("/health", methods=["GET"])
 def health():
     return {"ok": True}, 200
-
 
 @app.route("/voice", methods=["GET", "POST"])
 def voice():
@@ -38,7 +34,7 @@ def voice():
     print("Values:", dict(request.values))
 
     response = VoiceResponse()
-    process_url = request.url_root.rstrip("/") + "/process_speech"
+    process_url = request.url_root.replace("http://", "https://").rstrip("/") + "/process_speech"
 
     gather = Gather(
         input="speech",
@@ -49,22 +45,23 @@ def voice():
         timeout=5
     )
 
+    # Mensaje inicial en español
     gather.say(
         "Hola, soy tu asistente virtual. Desde dónde y hacia dónde necesitas viajar hoy.",
         voice="alice",
-        language="es-ES"
+        language="es-MX"
     )
     response.append(gather)
 
+    # Mensaje de fallback en español
     response.say(
         "No pude escucharte. Por favor vuelve a llamar o intenta de nuevo.",
         voice="alice",
-        language="es-ES"
+        language="es-MX"
     )
     response.hangup()
 
     return str(response), 200, {"Content-Type": "text/xml"}
-
 
 @app.route("/process_speech", methods=["GET", "POST"])
 def process_speech():
@@ -79,7 +76,7 @@ def process_speech():
         response.say(
             "Disculpa, no te entendí bien. Por favor repite tu dirección y destino.",
             voice="alice",
-            language="es-ES"
+            language="es-MX"
         )
         response.redirect("/voice", method="POST")
         return str(response), 200, {"Content-Type": "text/xml"}
@@ -88,16 +85,11 @@ def process_speech():
     respuesta_ia = procesar_con_ia(texto_usuario)
 
     if es_cierre(texto_usuario):
-        response.say(
-            respuesta_ia,
-            voice="alice",
-            language="es-ES"
-        )
+        response.say(respuesta_ia, voice="alice", language="es-MX")
         response.hangup()
         return str(response), 200, {"Content-Type": "text/xml"}
 
     process_url = request.url_root.rstrip("/") + "/process_speech"
-
     gather = Gather(
         input="speech",
         action=process_url,
@@ -106,30 +98,19 @@ def process_speech():
         speech_timeout="auto",
         timeout=5
     )
-
-    gather.say(
-        respuesta_ia,
-        voice="alice",
-        language="es-ES"
-    )
+    gather.say(respuesta_ia, voice="alice", language="es-MX")
     response.append(gather)
 
-    response.say(
-        "No escuché más información. Hasta luego.",
-        voice="alice",
-        language="es-ES"
-    )
+    response.say("No escuché más información. Hasta luego.", voice="alice", language="es-MX")
     response.hangup()
 
     return str(response), 200, {"Content-Type": "text/xml"}
-
 
 def es_cierre(texto: str) -> bool:
     texto_min = texto.lower()
     return any(word in texto_min for word in [
         "gracias", "eso es todo", "adiós", "adios", "no", "nada más", "nada mas"
     ])
-
 
 def procesar_con_ia(texto: str) -> str:
     if not client:
@@ -144,7 +125,7 @@ Reglas:
 - Si el usuario dice origen y destino, confirma la solicitud.
 - Si falta origen o destino, pide solo lo que falta.
 - Si el usuario quiere terminar, despídete.
-- No uses listas ni texto largo.
+- No uses texto largo.
 
 Mensaje del usuario:
 {texto}
@@ -154,11 +135,9 @@ Mensaje del usuario:
             input=prompt
         )
         return result.output_text.strip() or respuesta_simulada(texto)
-
     except Exception as e:
         print("Error OpenAI:", e)
         return respuesta_simulada(texto)
-
 
 def respuesta_simulada(texto: str) -> str:
     texto_min = texto.lower()
@@ -167,11 +146,10 @@ def respuesta_simulada(texto: str) -> str:
         return "Perfecto. Hemos recibido tu solicitud. Gracias por preferirnos. Que tengas un excelente día."
 
     if len(texto_min) > 10:
-        return "Entendido. Estamos procesando tu ruta. Enseguida te enviaremos los datos del conductor. Deseas agregar algo más."
+        return "Entendido. Estamos procesando tu ruta. Enseguida te enviaremos los datos del conductor. ¿Deseas agregar algo más?"
 
     return "Por favor indícame claramente la dirección exacta de recogida y tu destino."
 
-
 if __name__ == "__main__":
     print(f"Iniciando servidor en puerto {PORT}...")
-    app.run(host="0.0.0.0", port=PORT, debug=DEBUG)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
