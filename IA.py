@@ -51,13 +51,15 @@ def voice():
 
     gather.say(
         "Hola, soy tu asistente virtual. Desde dónde y hacia dónde necesitas viajar hoy.",
-        voice="Polly.Mia"
+        voice="alice",
+        language="es-ES"
     )
     response.append(gather)
 
     response.say(
         "No pude escucharte. Por favor vuelve a llamar o intenta de nuevo.",
-        voice="Polly.Mia"
+        voice="alice",
+        language="es-ES"
     )
     response.hangup()
 
@@ -76,7 +78,8 @@ def process_speech():
     if not texto_usuario:
         response.say(
             "Disculpa, no te entendí bien. Por favor repite tu dirección y destino.",
-            voice="Polly.Mia"
+            voice="alice",
+            language="es-ES"
         )
         response.redirect("/voice", method="POST")
         return str(response), 200, {"Content-Type": "text/xml"}
@@ -85,11 +88,16 @@ def process_speech():
     respuesta_ia = procesar_con_ia(texto_usuario)
 
     if es_cierre(texto_usuario):
-        response.say(respuesta_ia, voice="Polly.Mia")
+        response.say(
+            respuesta_ia,
+            voice="alice",
+            language="es-ES"
+        )
         response.hangup()
         return str(response), 200, {"Content-Type": "text/xml"}
 
     process_url = request.url_root.rstrip("/") + "/process_speech"
+
     gather = Gather(
         input="speech",
         action=process_url,
@@ -98,10 +106,19 @@ def process_speech():
         speech_timeout="auto",
         timeout=5
     )
-    gather.say(respuesta_ia, voice="Polly.Mia")
+
+    gather.say(
+        respuesta_ia,
+        voice="alice",
+        language="es-ES"
+    )
     response.append(gather)
 
-    response.say("No escuché más información. Hasta luego.", voice="Polly.Mia")
+    response.say(
+        "No escuché más información. Hasta luego.",
+        voice="alice",
+        language="es-ES"
+    )
     response.hangup()
 
     return str(response), 200, {"Content-Type": "text/xml"}
@@ -137,6 +154,7 @@ Mensaje del usuario:
             input=prompt
         )
         return result.output_text.strip() or respuesta_simulada(texto)
+
     except Exception as e:
         print("Error OpenAI:", e)
         return respuesta_simulada(texto)
