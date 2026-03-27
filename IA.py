@@ -1,4 +1,5 @@
 import os
+import datetime
 from flask import Flask, request
 from dotenv import load_dotenv
 from twilio.twiml.voice_response import VoiceResponse, Gather
@@ -18,6 +19,27 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip()
 
 client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
+
+HTML_LOG_FILE = "historial_conversacion.html"
+
+def registrar_mensaje(emisor: str, mensaje: str):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not os.path.exists(HTML_LOG_FILE):
+        with open(HTML_LOG_FILE, "w", encoding="utf-8") as f:
+            f.write("<!DOCTYPE html>\n<html>\n<head>\n<meta charset='UTF-8'>\n<title>Historial de Conversación</title>\n")
+            f.write("<style>\nbody{font-family: Arial, sans-serif; margin: 20px; background-color: #f9f9f9;}\n")
+            f.write(".message{margin-bottom: 15px; padding: 15px; border-radius: 8px; max-width: 80%; line-height: 1.5;}\n")
+            f.write(".ia{background-color: #e3f2fd; border-left: 5px solid #2196f3; margin-right: auto;}\n")
+            f.write(".usuario{background-color: #f1f8e9; border-left: 5px solid #8bc34a; margin-left: auto; color: #333;}\n")
+            f.write(".timestamp{font-size: 0.8em; color: #666; display: block; margin-top: 5px;}\n</style>\n</head>\n<body>\n")
+            f.write("<h2>Historial de Conversación</h2>\n")
+            
+    with open(HTML_LOG_FILE, "a", encoding="utf-8") as f:
+        clase = "ia" if emisor.upper() == "IA" else "usuario"
+        f.write(f"<div class='message {clase}'>\n")
+        f.write(f"<strong>{emisor}:</strong> {mensaje.strip()}<br>\n")
+        f.write(f"<span class='timestamp'>{timestamp}</span>\n")
+        f.write("</div>\n")
 
 @app.route("/", methods=["GET"])
 def home():
@@ -46,8 +68,10 @@ def voice():
     )
 
     # Mensaje inicial en español
+    mensaje_inicial = "Hola, soy tu asistente virtual. Desde dónde y hacia dónde necesitas viajar hoy."
+    registrar_mensaje("IA", mensaje_inicial)
     gather.say(
-        "Hola, soy tu asistente virtual. Desde dónde y hacia dónde necesitas viajar hoy.",
+        mensaje_inicial,
         voice="alice",
         language="es-MX"
     )
@@ -73,8 +97,10 @@ def process_speech():
     texto_usuario = request.values.get("SpeechResult", "").strip()
 
     if not texto_usuario:
+        mensaje_disculpa = "Disculpa, no te entendí bien. Por favor repite tu dirección y destino."
+        registrar_mensaje("IA", mensaje_disculpa)
         response.say(
-            "Disculpa, no te entendí bien. Por favor repite tu dirección y destino.",
+            mensaje_disculpa,
             voice="alice",
             language="es-MX"
         )
@@ -82,7 +108,10 @@ def process_speech():
         return str(response), 200, {"Content-Type": "text/xml"}
 
     print(f"Cliente dijo: {texto_usuario}")
+    registrar_mensaje("Usuario", texto_usuario)
+    
     respuesta_ia = procesar_con_ia(texto_usuario)
+    registrar_mensaje("IA", respuesta_ia)
 
     if es_cierre(texto_usuario):
         response.say(respuesta_ia, voice="alice", language="es-MX")
