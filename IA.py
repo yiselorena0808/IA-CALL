@@ -179,6 +179,7 @@ def respuesta_simulada(texto: str) -> str:
 
     return "Por favor indícame claramente la dirección exacta de recogida y tu destino."
 
+
 if __name__ == "__main__":
     print(f"Iniciando servidor en puerto {PORT}...")
     app.run(host="0.0.0.0", port=PORT, debug=False)
