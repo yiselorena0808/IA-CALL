@@ -1,5 +1,7 @@
 import os
 from flask import Flask, request
+import json
+import requests
 from dotenv import load_dotenv
 from twilio.twiml.voice_response import VoiceResponse, Gather
 
@@ -41,8 +43,8 @@ def voice():
         action=process_url,
         method="POST",
         language="es-MX",
-        speech_timeout="auto",
-        timeout=5
+        speech_timeout="3",
+        timeout=15
     )
 
     # Mensaje inicial en español
@@ -95,8 +97,8 @@ def process_speech():
         action=process_url,
         method="POST",
         language="es-MX",
-        speech_timeout="auto",
-        timeout=5
+        speech_timeout="3",
+        timeout=15
     )
     gather.say(respuesta_ia, voice="alice", language="es-MX")
     response.append(gather)
@@ -119,22 +121,58 @@ def procesar_con_ia(texto: str) -> str:
     try:
         prompt = f"""
 Eres un asistente telefónico para solicitar transporte.
-Responde en español, claro, corto y natural.
+Debes responder SIEMPRE en formato JSON con la siguiente estructura estricta:
+{{
+  "origen": "dirección de recogida reconocida, o null si falta",
+  "destino": "dirección de destino reconocida, o null si falta",
+  "mensaje": "Respuesta en español, clara, corta y natural."
+}}
 
 Reglas:
-- Si el usuario dice origen y destino, confirma la solicitud.
-- Si falta origen o destino, pide solo lo que falta.
-- Si el usuario quiere terminar, despídete.
+- Si el usuario dice origen y destino, tu 'mensaje' debe confirmar que procesarás la solicitud y se enviará la unidad.
+- Si falta origen o destino, tu 'mensaje' debe pedir específicamente lo que falta.
+- Si el usuario quiere terminar la llamada, despídete en el 'mensaje'.
 - No uses texto largo.
 
 Mensaje del usuario:
 {texto}
 """
-        result = client.responses.create(
+        result = client.chat.completions.create(
             model=OPENAI_MODEL,
-            input=prompt
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
         )
-        return result.output_text.strip() or respuesta_simulada(texto)
+        
+        data = json.loads(result.choices[0].message.content)
+        origen = data.get("origen")
+        destino = data.get("destino")
+        mensaje = data.get("mensaje", respuesta_simulada(texto))
+        
+        # Si la IA identificó origen y destino, llamamos al backend
+        if origen and destino:
+            print(f"[*] Origen: {origen} | Destino: {destino}. Enviando al backend...")
+            backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+            payload = {
+                "pasajero_id": 1, # Se debería obtener dinámicamente
+                "pasajero_nombre": "Usuario Telefónico",
+                "origen": origen,
+                "destino": destino,
+                "origen_lat": 0.0, # Requiere Geocoding real para funcionar completo en el map
+                "origen_lng": 0.0,
+                "destino_lat": 0.0,
+                "destino_lng": 0.0,
+                "clase_vehiculo": "TAXI",
+                "precio_estimado": 10000 
+            }
+            try:
+                # Utilizamos la nueva ruta dedicada para la IA que crea el ServicioMovil directamente
+                res = requests.post(f"{backend_url}/api/taxi/solicitud-telefonica", json=payload, timeout=5)
+                print("[*] Respuesta del Backend:", res.status_code, res.text)
+            except Exception as req_err:
+                print("[!] Error al conectar con el backend:", req_err)
+                
+        return mensaje
+
     except Exception as e:
         print("Error OpenAI:", e)
         return respuesta_simulada(texto)
