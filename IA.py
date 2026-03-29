@@ -68,11 +68,10 @@ def voice():
 @app.route("/process_speech", methods=["GET", "POST"])
 def process_speech():
     print("=== /process_speech ===")
-    print("Method:", request.method)
-    print("Values:", dict(request.values))
-
+    
     response = VoiceResponse()
     texto_usuario = request.values.get("SpeechResult", "").strip()
+    caller_id = request.values.get("From", "").replace("whatsapp:", "") # Limpiar prefijo si viene de whatsapp
 
     if not texto_usuario:
         response.say(
@@ -83,8 +82,8 @@ def process_speech():
         response.redirect("/voice", method="POST")
         return str(response), 200, {"Content-Type": "text/xml"}
 
-    print(f"Cliente dijo: {texto_usuario}")
-    respuesta_ia = procesar_con_ia(texto_usuario)
+    print(f"Cliente ({caller_id}) dijo: {texto_usuario}")
+    respuesta_ia = procesar_con_ia(texto_usuario, caller_id)
 
     if es_cierre(texto_usuario):
         response.say(respuesta_ia, voice="alice", language="es-MX")
@@ -114,7 +113,7 @@ def es_cierre(texto: str) -> bool:
         "gracias", "eso es todo", "adiós", "adios", "no", "nada más", "nada mas"
     ])
 
-def procesar_con_ia(texto: str) -> str:
+def procesar_con_ia(texto: str, celular: str = None) -> str:
     if not client:
         return respuesta_simulada(texto)
 
@@ -153,19 +152,19 @@ Mensaje del usuario:
             print(f"[*] Origen: {origen} | Destino: {destino}. Enviando al backend...")
             backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
             payload = {
-                "pasajero_id": 1, # Se debería obtener dinámicamente
+                "pasajero_id": 1,
+                "celular": celular,
                 "pasajero_nombre": "Usuario Telefónico",
                 "origen": origen,
                 "destino": destino,
-                "origen_lat": 0.0, # Requiere Geocoding real para funcionar completo en el map
+                "origen_lat": 0.0,
                 "origen_lng": 0.0,
                 "destino_lat": 0.0,
                 "destino_lng": 0.0,
                 "clase_vehiculo": "TAXI",
-                "precio_estimado": 10000 
+                "precio_estimado": 0.0
             }
             try:
-                # Utilizamos la nueva ruta dedicada para la IA que crea el ServicioMovil directamente
                 res = requests.post(f"{backend_url}/api/taxi/solicitud-telefonica", json=payload, timeout=5)
                 print("[*] Respuesta del Backend:", res.status_code, res.text)
             except Exception as req_err:
