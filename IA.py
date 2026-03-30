@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 from typing import Optional
+from urllib.parse import urlparse, urlunparse
 
 import requests
 from dotenv import load_dotenv
@@ -46,8 +47,49 @@ def _is_localhost_url(url: str) -> bool:
 
 
 def get_backend_url() -> str:
-    """BACKEND_URL sin barra final. Ej: https://api.midominio.com"""
-    return (os.getenv("BACKEND_URL") or "http://127.0.0.1:8000").strip().rstrip("/")
+    """
+    Acepta BACKEND_URL con o sin ``/api`` al final (p. ej. ngrok ``.../api/``).
+    Devuelve solo el origen (scheme + host + path sin ``/api``) para concatenar
+    SOLICITUD_TELEFONICA_PATH (``/api/taxi/...``) sin duplicar ``/api``.
+    """
+    raw = (os.getenv("BACKEND_URL") or "http://127.0.0.1:8000").strip()
+    if not raw:
+        raw = "http://127.0.0.1:8000"
+
+    parsed = urlparse(raw)
+    if not parsed.netloc and parsed.path:
+        parsed = urlparse(f"https://{raw.lstrip('/')}")
+
+    path = (parsed.path or "").rstrip("/")
+    while len(path) >= 4 and path.lower().endswith("/api"):
+        path = path[:-4].rstrip("/")
+
+    if parsed.scheme and parsed.netloc:
+        path_part = path if path else ""
+        base = urlunparse((parsed.scheme, parsed.netloc, path_part, "", "", ""))
+    else:
+        base = raw
+
+    base = base.rstrip("/")
+
+    if raw.rstrip("/") != base:
+        _ia(
+            "BACKEND_URL autocorregida (evita /api/api/...): entrada=%r -> base=%r",
+            raw,
+            base,
+        )
+
+    return base
+
+
+def _backend_post_headers(base: str) -> dict:
+    h = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if "ngrok" in base.lower():
+        h["ngrok-skip-browser-warning"] = "true"
+    return h
 
 
 def backend_url_allows_post() -> bool:
@@ -113,7 +155,7 @@ def post_solicitud_telefonica(payload: dict) -> None:
         res = requests.post(
             url,
             json=payload,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=_backend_post_headers(base),
             timeout=15,
         )
         _ia("Respuesta backend status_code=%s", res.status_code)
