@@ -23,6 +23,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("ia_call")
 
+
+def _ia(msg: str, *args) -> None:
+    log.info("[IA] " + msg, *args)
+
 app = Flask(__name__)
 
 PORT = int(os.getenv("PORT", "5000"))
@@ -83,11 +87,28 @@ def twilio_public_base_url() -> str:
 
 
 def post_solicitud_telefonica(payload: dict) -> None:
-    if not backend_url_allows_post():
-        return
     base = get_backend_url()
     url = f"{base}{SOLICITUD_TELEFONICA_PATH}"
-    log.info("Enviando POST a backend: %s", url)
+
+    _ia("BACKEND_URL configurada: %s", base)
+    _ia("URL destino completa: %s", url)
+    _ia("Path esperado: %s (debe coincidir exactamente)", SOLICITUD_TELEFONICA_PATH)
+
+    if _is_localhost_url(base):
+        _ia(
+            "ADVERTENCIA: BACKEND_URL parece localhost (%s). En Render el POST no llegará a tu PC.",
+            base,
+        )
+
+    if not backend_url_allows_post():
+        _ia(
+            "POST al backend OMITIDO (bloqueo Render+localhost). "
+            "Define BACKEND_URL=https://tu-ngrok-o-dominio.com o ALLOW_LOCALHOST_BACKEND=true"
+        )
+        return
+
+    _ia("Payload JSON a enviar: %s", json.dumps(payload, ensure_ascii=False, default=str))
+
     try:
         res = requests.post(
             url,
@@ -95,15 +116,17 @@ def post_solicitud_telefonica(payload: dict) -> None:
             headers={"Content-Type": "application/json", "Accept": "application/json"},
             timeout=15,
         )
-        log.info("Respuesta backend HTTP %s: %s", res.status_code, res.text[:500])
+        _ia("Respuesta backend status_code=%s", res.status_code)
+        body_preview = (res.text or "")[:2000]
+        _ia("Response body (primeros 2000 chars): %s", body_preview)
         if res.status_code >= 400:
             log.error(
-                "Fallo backend al crear solicitud telefónica: status=%s body=%s",
+                "[IA] Fallo backend solicitud telefónica status=%s body=%s",
                 res.status_code,
-                res.text[:1000],
+                res.text[:2000],
             )
     except requests.RequestException as exc:
-        log.exception("Error de red al llamar al backend: %s", exc)
+        log.exception("[IA] Error de red al llamar al backend URL=%s err=%s", url, exc)
 
 
 @app.route("/", methods=["GET"])
@@ -132,8 +155,8 @@ def health():
 
 @app.route("/voice", methods=["GET", "POST"])
 def voice():
-    log.info("/voice method=%s", request.method)
-    log.debug("Values keys: %s", list(request.values.keys()))
+    _ia("Request Twilio recibido en /voice method=%s", request.method)
+    _ia("Twilio form keys: %s", list(request.values.keys()))
 
     response = VoiceResponse()
     process_url = twilio_public_base_url() + "/process_speech"
@@ -164,7 +187,15 @@ def voice():
 
 @app.route("/process_speech", methods=["GET", "POST"])
 def process_speech():
-    log.info("/process_speech method=%s", request.method)
+    _ia("Request Twilio recibido en /process_speech method=%s", request.method)
+    _ia("Twilio form keys: %s", list(request.values.keys()))
+    # Valores útiles de Twilio (sin credenciales)
+    safe_debug = {
+        k: (request.values.get(k) or "")[:120]
+        for k in ("CallSid", "From", "To", "SpeechResult", "Confidence")
+        if k in request.values
+    }
+    _ia("Campos Twilio (recortados): %s", safe_debug)
 
     response = VoiceResponse()
     texto_usuario = request.values.get("SpeechResult", "").strip()
@@ -180,7 +211,7 @@ def process_speech():
         response.redirect(voice_url, method="POST")
         return str(response), 200, {"Content-Type": "text/xml"}
 
-    log.info("Cliente (%s) dijo: %s", caller_id, texto_usuario[:200])
+    _ia("Texto transcrito (SpeechResult), caller_id=%s texto=%s", caller_id, texto_usuario[:500])
     respuesta_ia = procesar_con_ia(texto_usuario, caller_id)
 
     if es_cierre(texto_usuario):
@@ -223,6 +254,7 @@ def es_cierre(texto: str) -> bool:
 
 def procesar_con_ia(texto: str, celular: Optional[str] = None) -> str:
     if not client:
+        _ia("OpenAI client no disponible (falta API key o paquete); no se enviará POST al backend desde IA simulada.")
         return respuesta_simulada(texto)
 
     try:
@@ -250,13 +282,22 @@ Mensaje del usuario:
             response_format={"type": "json_object"},
         )
 
-        data = json.loads(result.choices[0].message.content)
+        raw_content = result.choices[0].message.content
+        _ia("OpenAI respuesta JSON (raw): %s", (raw_content or "")[:1500])
+
+        data = json.loads(raw_content)
         origen = data.get("origen")
         destino = data.get("destino")
         mensaje = data.get("mensaje", respuesta_simulada(texto))
 
+        _ia(
+            "OpenAI parseado: origen=%r destino=%r (ambos deben ser no vacíos para POST backend)",
+            origen,
+            destino,
+        )
+
         if origen and destino:
-            log.info("Origen y destino detectados; enviando al backend Laravel.")
+            _ia("Origen y destino OK; iniciando POST a Laravel solicitud-telefonica.")
             payload = {
                 "pasajero_id": 1,
                 "celular": celular or None,
@@ -271,11 +312,17 @@ Mensaje del usuario:
                 "precio_estimado": 0.0,
             }
             post_solicitud_telefonica(payload)
+        else:
+            _ia(
+                "NO se envía POST al backend: falta origen o destino en JSON (origen=%r destino=%r)",
+                origen,
+                destino,
+            )
 
         return mensaje
 
     except Exception as e:
-        log.error("Error OpenAI: %s", e)
+        log.exception("[IA] Error OpenAI o parseo JSON: %s", e)
         return respuesta_simulada(texto)
 
 
@@ -292,5 +339,10 @@ def respuesta_simulada(texto: str) -> str:
 
 
 if __name__ == "__main__":
-    log.info("Iniciando servidor en puerto %s (BACKEND_URL=%s)", PORT, get_backend_url())
+    _ia(
+        "Iniciando servidor puerto=%s BACKEND_URL=%s RENDER=%s",
+        PORT,
+        get_backend_url(),
+        os.getenv("RENDER", ""),
+    )
     app.run(host="0.0.0.0", port=PORT, debug=False)
