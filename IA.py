@@ -2,7 +2,8 @@ import json
 import logging
 import os
 import sys
-from typing import Optional
+import time
+from typing import Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 
 import requests
@@ -24,9 +25,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("ia_call")
 
+# Prefijos: [IA][VOICE] [IA][SPEECH] [IA][OPENAI] [IA][BACKEND_REQUEST] [IA][BACKEND_RESPONSE] [IA][ERROR]
 
-def _ia(msg: str, *args) -> None:
-    log.info("[IA] " + msg, *args)
+
+def _log(tag: str, msg: str, *args) -> None:
+    log.info("[IA][%s] " + msg, tag, *args)
+
+
+def _log_exc(tag: str, msg: str, exc: BaseException) -> None:
+    log.exception("[IA][%s] %s: %s", tag, msg, exc)
 
 app = Flask(__name__)
 
@@ -35,9 +42,12 @@ PORT = int(os.getenv("PORT", "5000"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
+# Twilio Gather: más tolerante a pausas del usuario (evita cortes por silencio breve)
+TWILIO_SPEECH_TIMEOUT = os.getenv("TWILIO_SPEECH_TIMEOUT", "auto").strip()
+TWILIO_GATHER_TIMEOUT = int(os.getenv("TWILIO_GATHER_TIMEOUT", "25"))
+
 client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
 
-# Endpoint Laravel (mismo contrato que el panel operador / CrearServicioModal)
 SOLICITUD_TELEFONICA_PATH = "/api/taxi/solicitud-telefonica"
 
 
@@ -48,9 +58,7 @@ def _is_localhost_url(url: str) -> bool:
 
 def get_backend_url() -> str:
     """
-    Acepta BACKEND_URL con o sin ``/api`` al final (p. ej. ngrok ``.../api/``).
-    Devuelve solo el origen (scheme + host + path sin ``/api``) para concatenar
-    SOLICITUD_TELEFONICA_PATH (``/api/taxi/...``) sin duplicar ``/api``.
+    Origen sin sufijo /api duplicado (acepta BACKEND_URL .../api/ desde .env).
     """
     raw = (os.getenv("BACKEND_URL") or "http://127.0.0.1:8000").strip()
     if not raw:
@@ -73,13 +81,19 @@ def get_backend_url() -> str:
     base = base.rstrip("/")
 
     if raw.rstrip("/") != base:
-        _ia(
-            "BACKEND_URL autocorregida (evita /api/api/...): entrada=%r -> base=%r",
-            raw,
-            base,
-        )
+        _log("CONFIG", "BACKEND_URL normalizada: entrada=%r -> base=%r", raw, base)
 
     return base
+
+
+def build_solicitud_telefonica_url() -> str:
+    """
+    URL final del POST, sin // ni /api/api/.
+    Ej: https://host.ngrok-free.dev/api/taxi/solicitud-telefonica
+    """
+    base = get_backend_url().rstrip("/")
+    path = SOLICITUD_TELEFONICA_PATH if SOLICITUD_TELEFONICA_PATH.startswith("/") else f"/{SOLICITUD_TELEFONICA_PATH}"
+    return f"{base}{path}"
 
 
 def _backend_post_headers(base: str) -> dict:
@@ -93,28 +107,18 @@ def _backend_post_headers(base: str) -> dict:
 
 
 def backend_url_allows_post() -> bool:
-    """
-    En Render (RENDER=true), no enviar a localhost salvo ALLOW_LOCALHOST_BACKEND=true.
-    Evita que el POST muera en silencio apuntando al default local.
-    """
     url = get_backend_url()
     if _is_localhost_url(url):
         if os.getenv("RENDER") == "true" and os.getenv("ALLOW_LOCALHOST_BACKEND", "").lower() != "true":
-            log.error(
-                "BACKEND_URL apunta a localhost (%s) en Render. "
-                "Configura BACKEND_URL con la URL pública del Laravel o "
-                "ALLOW_LOCALHOST_BACKEND=true solo para depuración.",
-                url,
+            _log(
+                "ERROR",
+                "BACKEND_URL es localhost en Render; POST bloqueado. Use URL pública o ALLOW_LOCALHOST_BACKEND=true",
             )
             return False
     return True
 
 
 def twilio_public_base_url() -> str:
-    """
-    URL absoluta HTTPS para Twilio (Gather action / redirect).
-    Prioriza PUBLIC_BASE_URL en Render (proxy/SSL) y corrige http→https.
-    """
     explicit = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
     if explicit:
         if not explicit.startswith("http"):
@@ -130,45 +134,38 @@ def twilio_public_base_url() -> str:
 
 def post_solicitud_telefonica(payload: dict) -> None:
     base = get_backend_url()
-    url = f"{base}{SOLICITUD_TELEFONICA_PATH}"
+    url = build_solicitud_telefonica_url()
 
-    _ia("BACKEND_URL configurada: %s", base)
-    _ia("URL destino completa: %s", url)
-    _ia("Path esperado: %s (debe coincidir exactamente)", SOLICITUD_TELEFONICA_PATH)
+    _log("BACKEND_REQUEST", "BACKEND_URL (base)=%s", base)
+    _log("BACKEND_REQUEST", "URL POST final=%s", url)
+    _log("BACKEND_REQUEST", "Headers=%s", _backend_post_headers(base))
 
     if _is_localhost_url(base):
-        _ia(
-            "ADVERTENCIA: BACKEND_URL parece localhost (%s). En Render el POST no llegará a tu PC.",
-            base,
-        )
+        _log("BACKEND_REQUEST", "ADVERTENCIA: base parece localhost (Render no alcanza tu PC).")
 
     if not backend_url_allows_post():
-        _ia(
-            "POST al backend OMITIDO (bloqueo Render+localhost). "
-            "Define BACKEND_URL=https://tu-ngrok-o-dominio.com o ALLOW_LOCALHOST_BACKEND=true"
-        )
+        _log("BACKEND_REQUEST", "POST omitido por política Render/localhost.")
         return
 
-    _ia("Payload JSON a enviar: %s", json.dumps(payload, ensure_ascii=False, default=str))
+    _log("BACKEND_REQUEST", "Payload JSON=%s", json.dumps(payload, ensure_ascii=False, default=str))
 
+    t0 = time.perf_counter()
     try:
         res = requests.post(
             url,
             json=payload,
             headers=_backend_post_headers(base),
-            timeout=15,
+            timeout=30,
         )
-        _ia("Respuesta backend status_code=%s", res.status_code)
-        body_preview = (res.text or "")[:2000]
-        _ia("Response body (primeros 2000 chars): %s", body_preview)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        _log("BACKEND_RESPONSE", "status_code=%s tiempo_ms=%.0f", res.status_code, elapsed_ms)
+        _log("BACKEND_RESPONSE", "body (primeros 2500 chars)=%s", (res.text or "")[:2500])
         if res.status_code >= 400:
-            log.error(
-                "[IA] Fallo backend solicitud telefónica status=%s body=%s",
-                res.status_code,
-                res.text[:2000],
-            )
+            _log("ERROR", "Backend HTTP error status=%s body=%s", res.status_code, (res.text or "")[:2000])
+    except requests.Timeout as exc:
+        _log_exc("ERROR", "Timeout esperando al backend (>30s)", exc)
     except requests.RequestException as exc:
-        log.exception("[IA] Error de red al llamar al backend URL=%s err=%s", url, exc)
+        _log_exc("ERROR", "Error de red/DNS/SSL hacia backend", exc)
 
 
 @app.route("/", methods=["GET"])
@@ -188,29 +185,38 @@ def health():
         {
             "ok": True,
             "service": "ia-call",
-            "backend_url": backend,
+            "backend_url_base": backend,
+            "solicitud_url_completa": build_solicitud_telefonica_url(),
             "backend_post_blocked_on_render": blocked,
-            "solicitud_path": SOLICITUD_TELEFONICA_PATH,
+            "twilio_speech_timeout": TWILIO_SPEECH_TIMEOUT,
+            "twilio_gather_timeout": TWILIO_GATHER_TIMEOUT,
         }
     ), 200
 
 
+def _gather_kwargs():
+    """Parámetros Twilio Gather reutilizables (pausas más tolerantes)."""
+    return {
+        "input": "speech",
+        "language": "es-MX",
+        "speech_timeout": TWILIO_SPEECH_TIMEOUT,
+        "timeout": TWILIO_GATHER_TIMEOUT,
+    }
+
+
 @app.route("/voice", methods=["GET", "POST"])
 def voice():
-    _ia("Request Twilio recibido en /voice method=%s", request.method)
-    _ia("Twilio form keys: %s", list(request.values.keys()))
+    _log("VOICE", "Entrada llamada method=%s", request.method)
+    _log("VOICE", "form_keys=%s", list(request.values.keys()))
+    _log("VOICE", "CallSid=%s From=%s To=%s",
+        request.values.get("CallSid", ""),
+        request.values.get("From", ""),
+        request.values.get("To", ""))
 
     response = VoiceResponse()
     process_url = twilio_public_base_url() + "/process_speech"
 
-    gather = Gather(
-        input="speech",
-        action=process_url,
-        method="POST",
-        language="es-MX",
-        speech_timeout="3",
-        timeout=15,
-    )
+    gather = Gather(action=process_url, method="POST", **_gather_kwargs())
     gather.say(
         "Hola, soy tu asistente virtual. Desde dónde y hacia dónde necesitas viajar hoy.",
         voice="alice",
@@ -229,21 +235,30 @@ def voice():
 
 @app.route("/process_speech", methods=["GET", "POST"])
 def process_speech():
-    _ia("Request Twilio recibido en /process_speech method=%s", request.method)
-    _ia("Twilio form keys: %s", list(request.values.keys()))
-    # Valores útiles de Twilio (sin credenciales)
-    safe_debug = {
-        k: (request.values.get(k) or "")[:120]
-        for k in ("CallSid", "From", "To", "SpeechResult", "Confidence")
-        if k in request.values
-    }
-    _ia("Campos Twilio (recortados): %s", safe_debug)
+    _log("SPEECH", "Entrada method=%s", request.method)
+    _log("SPEECH", "form_keys=%s", list(request.values.keys()))
+    _log(
+        "SPEECH",
+        "CallSid=%s From=%s To=%s",
+        request.values.get("CallSid", ""),
+        request.values.get("From", ""),
+        request.values.get("To", ""),
+    )
+
+    conf = request.values.get("Confidence", "")
+    if conf:
+        _log("SPEECH", "Confidence(stt)=%s", conf)
 
     response = VoiceResponse()
-    texto_usuario = request.values.get("SpeechResult", "").strip()
+    texto_crudo = request.values.get("SpeechResult", "") or ""
+    texto_usuario = texto_crudo.strip()
     caller_id = request.values.get("From", "").replace("whatsapp:", "")
 
+    _log("SPEECH", "SpeechResult crudo (len=%s)=%s", len(texto_crudo), texto_crudo[:800])
+    _log("SPEECH", "Texto limpio caller_id=%s texto=%s", caller_id, texto_usuario[:800])
+
     if not texto_usuario:
+        _log("SPEECH", "Sin SpeechResult: posible silencio o timeout STT; reintentando /voice")
         response.say(
             "Disculpa, no te entendí bien. Por favor repite tu dirección y destino.",
             voice="alice",
@@ -253,51 +268,61 @@ def process_speech():
         response.redirect(voice_url, method="POST")
         return str(response), 200, {"Content-Type": "text/xml"}
 
-    _ia("Texto transcrito (SpeechResult), caller_id=%s texto=%s", caller_id, texto_usuario[:500])
-    respuesta_ia = procesar_con_ia(texto_usuario, caller_id)
+    respuesta_ia, envio_backend = procesar_con_ia(texto_usuario, caller_id)
+    _log("SPEECH", "Mensaje TTS a reproducir (preview)=%s", respuesta_ia[:400])
+    _log("SPEECH", "¿Se intentó POST al backend en este turno?=%s", envio_backend)
+
+    if envio_backend:
+        response.say(
+            "Un momento, estamos registrando tu solicitud.",
+            voice="alice",
+            language="es-MX",
+        )
 
     if es_cierre(texto_usuario):
+        _log("SPEECH", "Detección cierre de llamada (despedida) sobre texto usuario")
         response.say(respuesta_ia, voice="alice", language="es-MX")
         response.hangup()
         return str(response), 200, {"Content-Type": "text/xml"}
 
     process_url = twilio_public_base_url() + "/process_speech"
-    gather = Gather(
-        input="speech",
-        action=process_url,
-        method="POST",
-        language="es-MX",
-        speech_timeout="3",
-        timeout=15,
-    )
+    gather = Gather(action=process_url, method="POST", **_gather_kwargs())
     gather.say(respuesta_ia, voice="alice", language="es-MX")
     response.append(gather)
-    response.say("No escuché más información. Hasta luego.", voice="alice", language="es-MX")
+    response.say("Si necesitas algo más, habla ahora. Si no, puedes colgar.", voice="alice", language="es-MX")
     response.hangup()
 
     return str(response), 200, {"Content-Type": "text/xml"}
 
 
 def es_cierre(texto: str) -> bool:
-    texto_min = texto.lower()
-    return any(
-        word in texto_min
-        for word in [
-            "gracias",
-            "eso es todo",
-            "adiós",
-            "adios",
-            "no",
-            "nada más",
-            "nada mas",
-        ]
+    """
+    Despedida explícita. No usar la palabra suelta 'no' (provocaba cortes en frases normales).
+    """
+    t = (texto or "").lower().strip()
+    frases = (
+        "gracias",
+        "eso es todo",
+        "adiós",
+        "adios",
+        "nada más",
+        "nada mas",
+        "listo gracias",
+        "ya está",
+        "ya esta",
+        "chao",
+        "hasta luego",
     )
+    return any(p in t for p in frases)
 
 
-def procesar_con_ia(texto: str, celular: Optional[str] = None) -> str:
+def procesar_con_ia(texto: str, celular: Optional[str] = None) -> Tuple[str, bool]:
+    """
+    Retorna (mensaje_para_usuario, se_hizo_post_backend).
+    """
     if not client:
-        _ia("OpenAI client no disponible (falta API key o paquete); no se enviará POST al backend desde IA simulada.")
-        return respuesta_simulada(texto)
+        _log("OPENAI", "Cliente OpenAI no configurado; modo simulado, sin POST backend.")
+        return respuesta_simulada(texto), False
 
     try:
         prompt = f"""
@@ -318,28 +343,37 @@ Reglas:
 Mensaje del usuario:
 {texto}
 """
+        _log("OPENAI", "Enviando prompt a modelo=%s (texto usuario len=%s)", OPENAI_MODEL, len(texto))
+
+        t0 = time.perf_counter()
         result = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
         )
+        _log("OPENAI", "Respuesta OpenAI recibida tiempo_ms=%.0f", (time.perf_counter() - t0) * 1000.0)
 
         raw_content = result.choices[0].message.content
-        _ia("OpenAI respuesta JSON (raw): %s", (raw_content or "")[:1500])
+        _log("OPENAI", "JSON raw (primeros 1500 chars)=%s", (raw_content or "")[:1500])
 
         data = json.loads(raw_content)
         origen = data.get("origen")
         destino = data.get("destino")
         mensaje = data.get("mensaje", respuesta_simulada(texto))
 
-        _ia(
-            "OpenAI parseado: origen=%r destino=%r (ambos deben ser no vacíos para POST backend)",
+        o_ok = origen not in (None, "", "null")
+        d_ok = destino not in (None, "", "null")
+        _log(
+            "OPENAI",
+            "Parseado origen_ok=%s destino_ok=%s origen=%r destino=%r",
+            o_ok,
+            d_ok,
             origen,
             destino,
         )
 
-        if origen and destino:
-            _ia("Origen y destino OK; iniciando POST a Laravel solicitud-telefonica.")
+        if o_ok and d_ok:
+            _log("OPENAI", "Origen y destino completos; ejecutando POST Laravel.")
             payload = {
                 "pasajero_id": 1,
                 "celular": celular or None,
@@ -354,18 +388,14 @@ Mensaje del usuario:
                 "precio_estimado": 0.0,
             }
             post_solicitud_telefonica(payload)
-        else:
-            _ia(
-                "NO se envía POST al backend: falta origen o destino en JSON (origen=%r destino=%r)",
-                origen,
-                destino,
-            )
+            return mensaje, True
 
-        return mensaje
+        _log("OPENAI", "No POST backend: falta origen o destino válido en JSON.")
+        return mensaje, False
 
     except Exception as e:
-        log.exception("[IA] Error OpenAI o parseo JSON: %s", e)
-        return respuesta_simulada(texto)
+        _log_exc("ERROR", "Fallo OpenAI o JSON", e)
+        return respuesta_simulada(texto), False
 
 
 def respuesta_simulada(texto: str) -> str:
@@ -381,10 +411,10 @@ def respuesta_simulada(texto: str) -> str:
 
 
 if __name__ == "__main__":
-    _ia(
-        "Iniciando servidor puerto=%s BACKEND_URL=%s RENDER=%s",
-        PORT,
-        get_backend_url(),
-        os.getenv("RENDER", ""),
-    )
+    _log("CONFIG", "Arranque puerto=%s BACKEND_URL_raw=%s base=%s url_post=%s RENDER=%s",
+         PORT,
+         (os.getenv("BACKEND_URL") or ""),
+         get_backend_url(),
+         build_solicitud_telefonica_url(),
+         os.getenv("RENDER", ""))
     app.run(host="0.0.0.0", port=PORT, debug=False)
