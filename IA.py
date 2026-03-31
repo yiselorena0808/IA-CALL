@@ -50,6 +50,13 @@ client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
 
 SOLICITUD_TELEFONICA_PATH = "/api/taxi/solicitud-telefonica"
 
+GEOCODE_ENABLED = os.getenv("GEOCODE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y")
+GEOCODE_PROVIDER = (os.getenv("GEOCODE_PROVIDER") or "nominatim").strip().lower()
+NOMINATIM_URL = (os.getenv("NOMINATIM_URL") or "https://nominatim.openstreetmap.org/search").strip()
+GEOCODE_COUNTRYCODES = (os.getenv("GEOCODE_COUNTRYCODES") or "co").strip()
+GEOCODE_SUFFIX = (os.getenv("GEOCODE_SUFFIX") or "Popayán, Cauca, Colombia").strip()
+GEOCODE_TIMEOUT = float(os.getenv("GEOCODE_TIMEOUT", "8"))
+
 
 def _is_localhost_url(url: str) -> bool:
     u = (url or "").lower()
@@ -166,6 +173,72 @@ def post_solicitud_telefonica(payload: dict) -> None:
         _log_exc("ERROR", "Timeout esperando al backend (>30s)", exc)
     except requests.RequestException as exc:
         _log_exc("ERROR", "Error de red/DNS/SSL hacia backend", exc)
+
+
+def _nominatim_geocode(query: str) -> Optional[Tuple[float, float, str]]:
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    headers = {
+        "User-Agent": "ia-call/virtual-school-taxi (contact: admin)",
+        "Accept": "application/json",
+    }
+    params = {
+        "q": q,
+        "format": "json",
+        "limit": 1,
+        "addressdetails": 0,
+    }
+    if GEOCODE_COUNTRYCODES:
+        params["countrycodes"] = GEOCODE_COUNTRYCODES
+
+    _log("BACKEND_REQUEST", "Geocode Nominatim q=%r url=%s", q, NOMINATIM_URL)
+    try:
+        r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=GEOCODE_TIMEOUT)
+        if r.status_code != 200:
+            _log("ERROR", "Geocode HTTP %s body=%s", r.status_code, (r.text or "")[:500])
+            return None
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            return None
+        row = data[0] or {}
+        lat = float(row.get("lat") or 0.0)
+        lon = float(row.get("lon") or 0.0)
+        name = str(row.get("display_name") or "")
+        if abs(lat) < 1e-9 and abs(lon) < 1e-9:
+            return None
+        return lat, lon, name
+    except Exception as exc:
+        _log_exc("ERROR", "Geocode exception", exc)
+        return None
+
+
+def maybe_geocode_pair(origen: str, destino: str) -> Tuple[Tuple[float, float, str], Tuple[float, float, str]]:
+    """
+    Retorna ((olat, olng, ometa), (dlat, dlng, dmeta)).
+    Si no hay resultado, lat/lng quedan 0.0.
+    """
+    if not GEOCODE_ENABLED:
+        return (0.0, 0.0, "geocode_disabled"), (0.0, 0.0, "geocode_disabled")
+
+    if GEOCODE_PROVIDER != "nominatim":
+        return (0.0, 0.0, f"provider_not_supported:{GEOCODE_PROVIDER}"), (0.0, 0.0, f"provider_not_supported:{GEOCODE_PROVIDER}")
+
+    def _q(x: str) -> str:
+        x = (x or "").strip()
+        if not x:
+            return x
+        if GEOCODE_SUFFIX and GEOCODE_SUFFIX.lower() not in x.lower():
+            return f"{x}, {GEOCODE_SUFFIX}"
+        return x
+
+    o = _nominatim_geocode(_q(origen))
+    d = _nominatim_geocode(_q(destino))
+
+    o_out = (o[0], o[1], o[2]) if o else (0.0, 0.0, "no_result")
+    d_out = (d[0], d[1], d[2]) if d else (0.0, 0.0, "no_result")
+    return o_out, d_out
 
 
 @app.route("/", methods=["GET"])
@@ -374,16 +447,19 @@ Mensaje del usuario:
 
         if o_ok and d_ok:
             _log("OPENAI", "Origen y destino completos; ejecutando POST Laravel.")
+            (olat, olng, odisp), (dlat, dlng, ddisp) = maybe_geocode_pair(origen, destino)
+            _log("BACKEND_REQUEST", "Geocode resultado origen=(%.6f, %.6f) meta=%r destino=(%.6f, %.6f) meta=%r",
+                 olat, olng, odisp, dlat, dlng, ddisp)
             payload = {
                 "pasajero_id": 1,
                 "celular": celular or None,
                 "pasajero_nombre": "Usuario Telefónico",
                 "origen": origen,
                 "destino": destino,
-                "origen_lat": 0.0,
-                "origen_lng": 0.0,
-                "destino_lat": 0.0,
-                "destino_lng": 0.0,
+                "origen_lat": float(olat),
+                "origen_lng": float(olng),
+                "destino_lat": float(dlat),
+                "destino_lng": float(dlng),
                 "clase_vehiculo": "TAXI",
                 "precio_estimado": 0.0,
             }
