@@ -35,6 +35,7 @@ def _log(tag: str, msg: str, *args) -> None:
 def _log_exc(tag: str, msg: str, exc: BaseException) -> None:
     log.exception("[IA][%s] %s: %s", tag, msg, exc)
 
+
 app = Flask(__name__)
 
 PORT = int(os.getenv("PORT", "5000"))
@@ -45,6 +46,12 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 # Twilio Gather: más tolerante a pausas del usuario (evita cortes por silencio breve)
 TWILIO_SPEECH_TIMEOUT = os.getenv("TWILIO_SPEECH_TIMEOUT", "auto").strip()
 TWILIO_GATHER_TIMEOUT = int(os.getenv("TWILIO_GATHER_TIMEOUT", "25"))
+
+# Voz global para Twilio TTS
+# Opciones recomendadas:
+# - "Polly.Mia"
+# - "Polly.Mia-Neural" (si tu cuenta Twilio lo soporta)
+TWILIO_VOICE = os.getenv("TWILIO_VOICE", "Polly.Mia").strip()
 
 client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
 
@@ -131,11 +138,11 @@ def twilio_public_base_url() -> str:
         if not explicit.startswith("http"):
             explicit = "https://" + explicit
         if explicit.startswith("http://"):
-            explicit = "https://" + explicit[len("http://") :]
+            explicit = "https://" + explicit[len("http://"):]
         return explicit
     root = request.url_root.rstrip("/")
     if root.startswith("http://"):
-        root = "https://" + root[len("http://") :]
+        root = "https://" + root[len("http://"):]
     return root
 
 
@@ -223,7 +230,11 @@ def maybe_geocode_pair(origen: str, destino: str) -> Tuple[Tuple[float, float, s
         return (0.0, 0.0, "geocode_disabled"), (0.0, 0.0, "geocode_disabled")
 
     if GEOCODE_PROVIDER != "nominatim":
-        return (0.0, 0.0, f"provider_not_supported:{GEOCODE_PROVIDER}"), (0.0, 0.0, f"provider_not_supported:{GEOCODE_PROVIDER}")
+        return (0.0, 0.0, f"provider_not_supported:{GEOCODE_PROVIDER}"), (
+            0.0,
+            0.0,
+            f"provider_not_supported:{GEOCODE_PROVIDER}",
+        )
 
     def _q(x: str) -> str:
         x = (x or "").strip()
@@ -263,6 +274,7 @@ def health():
             "backend_post_blocked_on_render": blocked,
             "twilio_speech_timeout": TWILIO_SPEECH_TIMEOUT,
             "twilio_gather_timeout": TWILIO_GATHER_TIMEOUT,
+            "twilio_voice": TWILIO_VOICE,
         }
     ), 200
 
@@ -281,10 +293,13 @@ def _gather_kwargs():
 def voice():
     _log("VOICE", "Entrada llamada method=%s", request.method)
     _log("VOICE", "form_keys=%s", list(request.values.keys()))
-    _log("VOICE", "CallSid=%s From=%s To=%s",
+    _log(
+        "VOICE",
+        "CallSid=%s From=%s To=%s",
         request.values.get("CallSid", ""),
         request.values.get("From", ""),
-        request.values.get("To", ""))
+        request.values.get("To", ""),
+    )
 
     response = VoiceResponse()
     process_url = twilio_public_base_url() + "/process_speech"
@@ -292,13 +307,13 @@ def voice():
     gather = Gather(action=process_url, method="POST", **_gather_kwargs())
     gather.say(
         "Hola, soy tu asistente virtual. Desde dónde y hacia dónde necesitas viajar hoy.",
-        voice="alice",
+        voice=TWILIO_VOICE,
         language="es-MX",
     )
     response.append(gather)
     response.say(
         "No pude escucharte. Por favor vuelve a llamar o intenta de nuevo.",
-        voice="alice",
+        voice=TWILIO_VOICE,
         language="es-MX",
     )
     response.hangup()
@@ -334,7 +349,7 @@ def process_speech():
         _log("SPEECH", "Sin SpeechResult: posible silencio o timeout STT; reintentando /voice")
         response.say(
             "Disculpa, no te entendí bien. Por favor repite tu dirección y destino.",
-            voice="alice",
+            voice=TWILIO_VOICE,
             language="es-MX",
         )
         voice_url = twilio_public_base_url() + "/voice"
@@ -348,21 +363,25 @@ def process_speech():
     if envio_backend:
         response.say(
             "Un momento, estamos registrando tu solicitud.",
-            voice="alice",
+            voice=TWILIO_VOICE,
             language="es-MX",
         )
 
     if es_cierre(texto_usuario):
         _log("SPEECH", "Detección cierre de llamada (despedida) sobre texto usuario")
-        response.say(respuesta_ia, voice="alice", language="es-MX")
+        response.say(respuesta_ia, voice=TWILIO_VOICE, language="es-MX")
         response.hangup()
         return str(response), 200, {"Content-Type": "text/xml"}
 
     process_url = twilio_public_base_url() + "/process_speech"
     gather = Gather(action=process_url, method="POST", **_gather_kwargs())
-    gather.say(respuesta_ia, voice="alice", language="es-MX")
+    gather.say(respuesta_ia, voice=TWILIO_VOICE, language="es-MX")
     response.append(gather)
-    response.say("Si necesitas algo más, habla ahora. Si no, puedes colgar.", voice="alice", language="es-MX")
+    response.say(
+        "Si necesitas algo más, habla ahora. Si no, puedes colgar.",
+        voice=TWILIO_VOICE,
+        language="es-MX",
+    )
     response.hangup()
 
     return str(response), 200, {"Content-Type": "text/xml"}
@@ -448,8 +467,16 @@ Mensaje del usuario:
         if o_ok and d_ok:
             _log("OPENAI", "Origen y destino completos; ejecutando POST Laravel.")
             (olat, olng, odisp), (dlat, dlng, ddisp) = maybe_geocode_pair(origen, destino)
-            _log("BACKEND_REQUEST", "Geocode resultado origen=(%.6f, %.6f) meta=%r destino=(%.6f, %.6f) meta=%r",
-                 olat, olng, odisp, dlat, dlng, ddisp)
+            _log(
+                "BACKEND_REQUEST",
+                "Geocode resultado origen=(%.6f, %.6f) meta=%r destino=(%.6f, %.6f) meta=%r",
+                olat,
+                olng,
+                odisp,
+                dlat,
+                dlng,
+                ddisp,
+            )
             payload = {
                 "pasajero_id": 1,
                 "celular": celular or None,
@@ -487,10 +514,14 @@ def respuesta_simulada(texto: str) -> str:
 
 
 if __name__ == "__main__":
-    _log("CONFIG", "Arranque puerto=%s BACKEND_URL_raw=%s base=%s url_post=%s RENDER=%s",
-         PORT,
-         (os.getenv("BACKEND_URL") or ""),
-         get_backend_url(),
-         build_solicitud_telefonica_url(),
-         os.getenv("RENDER", ""))
+    _log(
+        "CONFIG",
+        "Arranque puerto=%s BACKEND_URL_raw=%s base=%s url_post=%s RENDER=%s voz=%s",
+        PORT,
+        (os.getenv("BACKEND_URL") or ""),
+        get_backend_url(),
+        build_solicitud_telefonica_url(),
+        os.getenv("RENDER", ""),
+        TWILIO_VOICE,
+    )
     app.run(host="0.0.0.0", port=PORT, debug=False)
