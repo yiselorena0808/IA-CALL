@@ -11,7 +11,7 @@ import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
@@ -140,6 +140,8 @@ client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
 
 SOLICITUD_TELEFONICA_PATH = "/api/taxi/solicitud-telefonica"
 
+BACKEND_HTTP_TIMEOUT = float(os.getenv("BACKEND_HTTP_TIMEOUT", "60"))
+
 GEOCODE_ENABLED = os.getenv("GEOCODE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y")
 GEOCODE_PROVIDER = (os.getenv("GEOCODE_PROVIDER") or "nominatim").strip().lower()
 NOMINATIM_URL = (os.getenv("NOMINATIM_URL") or "https://nominatim.openstreetmap.org/search").strip()
@@ -148,6 +150,18 @@ GEOCODE_SUFFIX = (os.getenv("GEOCODE_SUFFIX") or "Popayán, Cauca, Colombia").st
 GEOCODE_TIMEOUT = float(os.getenv("GEOCODE_TIMEOUT", "5"))
 GEOCODE_VIEWBOX = (os.getenv("GEOCODE_VIEWBOX") or "-76.82,2.58,-76.42,2.32").strip()
 GEOCODE_BOUNDED = os.getenv("GEOCODE_BOUNDED", "true").strip().lower() in ("1", "true", "yes", "y")
+# Nominatim público: máx. ~1 req/s por IP; paralelo + ráfagas → 429
+GEOCODE_MIN_INTERVAL_SEC = max(0.5, float(os.getenv("GEOCODE_MIN_INTERVAL_SEC", "1.1")))
+GEOCODE_MAX_RETRIES = max(1, int(os.getenv("GEOCODE_MAX_RETRIES", "4")))
+GEOCODE_CACHE_SIZE = max(16, int(os.getenv("GEOCODE_CACHE_SIZE", "256")))
+GEOCODE_USER_AGENT = (os.getenv("GEOCODE_USER_AGENT") or "").strip() or (
+    "ia-call/virtual-school-taxi (https://github.com; contact: set GEOCODE_USER_AGENT)"
+)
+
+_GEOCODE_CACHE: OrderedDict = OrderedDict()
+_GEOCODE_CACHE_LOCK = threading.Lock()
+_NOMINATIM_HTTP_LOCK = threading.Lock()
+_NOMINATIM_LAST_REQUEST_END = 0.0
 
 MAX_SILENCE_BEFORE_HANGUP = int(os.getenv("MAX_SILENCE_BEFORE_HANGUP", "3"))
 
@@ -307,7 +321,7 @@ def post_solicitud_telefonica(payload: dict) -> bool:
             url,
             json=payload,
             headers=_backend_post_headers(base),
-            timeout=12,
+            timeout=BACKEND_HTTP_TIMEOUT,
         )
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         _log("BACKEND_RESPONSE", "status_code=%s tiempo_ms=%.0f", res.status_code, elapsed_ms)
@@ -317,14 +331,31 @@ def post_solicitud_telefonica(payload: dict) -> bool:
             return False
         return True
     except requests.Timeout as exc:
-        _log_exc("ERROR", "Timeout esperando al backend (>12s)", exc)
+        _log_exc("ERROR", f"Timeout esperando al backend (>{BACKEND_HTTP_TIMEOUT:g}s)", exc)
         return False
     except requests.RequestException as exc:
         _log_exc("ERROR", "Error de red/DNS/SSL hacia backend", exc)
         return False
 
 
+def _geocode_cache_get(key: str) -> Optional[Tuple[float, float, str]]:
+    with _GEOCODE_CACHE_LOCK:
+        if key in _GEOCODE_CACHE:
+            _GEOCODE_CACHE.move_to_end(key)
+            return _GEOCODE_CACHE[key]
+    return None
+
+
+def _geocode_cache_set(key: str, val: Tuple[float, float, str]) -> None:
+    with _GEOCODE_CACHE_LOCK:
+        _GEOCODE_CACHE[key] = val
+        _GEOCODE_CACHE.move_to_end(key)
+        while len(_GEOCODE_CACHE) > GEOCODE_CACHE_SIZE:
+            _GEOCODE_CACHE.popitem(last=False)
+
+
 def _nominatim_geocode(query: str) -> Optional[Tuple[float, float, str]]:
+    global _NOMINATIM_LAST_REQUEST_END
     q = (query or "").strip()
     if not q:
         return None
@@ -332,8 +363,12 @@ def _nominatim_geocode(query: str) -> Optional[Tuple[float, float, str]]:
     if GEOCODE_SUFFIX and GEOCODE_SUFFIX.lower() not in q.lower():
         q = f"{q}, {GEOCODE_SUFFIX}"
 
+    cached = _geocode_cache_get(q)
+    if cached is not None:
+        return cached
+
     headers = {
-        "User-Agent": "ia-call/virtual-school-taxi (contact: admin)",
+        "User-Agent": GEOCODE_USER_AGENT,
         "Accept": "application/json",
     }
     params: Dict[str, Any] = {
@@ -349,11 +384,47 @@ def _nominatim_geocode(query: str) -> Optional[Tuple[float, float, str]]:
         params["bounded"] = "1"
 
     _log("BACKEND_REQUEST", "Geocode Nominatim q=%r", q)
+    r: Optional[requests.Response] = None
     try:
-        r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=GEOCODE_TIMEOUT)
-        if r.status_code != 200:
+        for attempt in range(GEOCODE_MAX_RETRIES):
+            with _NOMINATIM_HTTP_LOCK:
+                now = time.monotonic()
+                wait = _NOMINATIM_LAST_REQUEST_END + GEOCODE_MIN_INTERVAL_SEC - now
+                if wait > 0:
+                    time.sleep(wait)
+                try:
+                    r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=GEOCODE_TIMEOUT)
+                finally:
+                    _NOMINATIM_LAST_REQUEST_END = time.monotonic()
+
+            if r is None:
+                return None
+
+            if r.status_code == 200:
+                break
+
+            if r.status_code == 429 and attempt < GEOCODE_MAX_RETRIES - 1:
+                ra = r.headers.get("Retry-After")
+                try:
+                    delay = float(ra) if ra else min(2.0**attempt, 30.0)
+                except ValueError:
+                    delay = min(2.0**attempt, 30.0)
+                _log("GEOCODE", "Nominatim 429, reintento en %.1fs (intento %s/%s)", delay, attempt + 1, GEOCODE_MAX_RETRIES)
+                time.sleep(delay)
+                continue
+
+            if r.status_code in (502, 503, 504) and attempt < GEOCODE_MAX_RETRIES - 1:
+                delay = min(2.0**attempt, 15.0)
+                _log("GEOCODE", "Nominatim %s, reintento en %.1fs", r.status_code, delay)
+                time.sleep(delay)
+                continue
+
             _log("ERROR", "Geocode HTTP %s body=%s", r.status_code, (r.text or "")[:500])
             return None
+
+        if r is None or r.status_code != 200:
+            return None
+
         data = r.json()
         if not isinstance(data, list) or not data:
             return None
@@ -366,7 +437,9 @@ def _nominatim_geocode(query: str) -> Optional[Tuple[float, float, str]]:
                 continue
             if in_popayan_bbox(lat, lon):
                 name = str(row.get("display_name") or "")
-                return lat, lon, name
+                out = (lat, lon, name)
+                _geocode_cache_set(q, out)
+                return out
         return None
     except Exception as exc:
         _log_exc("ERROR", "Geocode exception", exc)
@@ -383,7 +456,8 @@ def geocode_origin_and_optional_destination(
     origen: str, destino: Optional[str]
 ) -> Tuple[Optional[Tuple[float, float, str]], Optional[Tuple[float, float, str]]]:
     """
-    Si hay destino, geocodifica origen y destino en paralelo (Twilio corta webhooks ~15s).
+    Geocodifica en serie: Nominatim público no admite peticiones paralelas (~1 req/s por IP).
+    El lock + intervalo en _nominatim_geocode evita 429; origen y destino se piden uno tras otro.
     """
     if not GEOCODE_ENABLED or GEOCODE_PROVIDER != "nominatim":
         return None, None
@@ -391,30 +465,19 @@ def geocode_origin_and_optional_destination(
     if not o:
         return None, None
     d = (destino or "").strip()
-    if not d:
-        return _nominatim_geocode(o), None
-
-    def _run(label: str, q: str) -> Optional[Tuple[float, float, str]]:
-        try:
-            return _nominatim_geocode(q)
-        except Exception as exc:
-            _log_exc("ERROR", f"geocode_parallel {label}", exc)
-            return None
-
     t0 = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_o = ex.submit(_run, "origen", o)
-        f_d = ex.submit(_run, "destino", d)
-        try:
-            g_o = f_o.result(timeout=GEOCODE_TIMEOUT + 2.0)
-            g_d = f_d.result(timeout=GEOCODE_TIMEOUT + 2.0)
-        except FuturesTimeout:
-            _log("ERROR", "geocode_parallel timeout esperando Nominatim")
-            g_o = None
+    try:
+        g_o = _nominatim_geocode(o)
+        if not d:
             g_d = None
+        else:
+            g_d = _nominatim_geocode(d)
+    except Exception as exc:
+        _log_exc("ERROR", "geocode origen/destino", exc)
+        g_o, g_d = None, None
     _log(
         "GEOCODE",
-        "paralelo OK origen=%s destino=%s tiempo_ms=%.0f",
+        "serie OK origen=%s destino=%s tiempo_ms=%.0f",
         g_o is not None,
         g_d is not None,
         (time.perf_counter() - t0) * 1000.0,
