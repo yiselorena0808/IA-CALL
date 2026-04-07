@@ -11,6 +11,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
@@ -144,7 +145,7 @@ GEOCODE_PROVIDER = (os.getenv("GEOCODE_PROVIDER") or "nominatim").strip().lower(
 NOMINATIM_URL = (os.getenv("NOMINATIM_URL") or "https://nominatim.openstreetmap.org/search").strip()
 GEOCODE_COUNTRYCODES = (os.getenv("GEOCODE_COUNTRYCODES") or "co").strip()
 GEOCODE_SUFFIX = (os.getenv("GEOCODE_SUFFIX") or "Popayán, Cauca, Colombia").strip()
-GEOCODE_TIMEOUT = float(os.getenv("GEOCODE_TIMEOUT", "8"))
+GEOCODE_TIMEOUT = float(os.getenv("GEOCODE_TIMEOUT", "5"))
 GEOCODE_VIEWBOX = (os.getenv("GEOCODE_VIEWBOX") or "-76.82,2.58,-76.42,2.32").strip()
 GEOCODE_BOUNDED = os.getenv("GEOCODE_BOUNDED", "true").strip().lower() in ("1", "true", "yes", "y")
 
@@ -306,7 +307,7 @@ def post_solicitud_telefonica(payload: dict) -> bool:
             url,
             json=payload,
             headers=_backend_post_headers(base),
-            timeout=25,
+            timeout=12,
         )
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         _log("BACKEND_RESPONSE", "status_code=%s tiempo_ms=%.0f", res.status_code, elapsed_ms)
@@ -316,7 +317,7 @@ def post_solicitud_telefonica(payload: dict) -> bool:
             return False
         return True
     except requests.Timeout as exc:
-        _log_exc("ERROR", "Timeout esperando al backend (>25s)", exc)
+        _log_exc("ERROR", "Timeout esperando al backend (>12s)", exc)
         return False
     except requests.RequestException as exc:
         _log_exc("ERROR", "Error de red/DNS/SSL hacia backend", exc)
@@ -378,6 +379,49 @@ def geocode_address(text: str) -> Optional[Tuple[float, float, str]]:
     return _nominatim_geocode(text)
 
 
+def geocode_origin_and_optional_destination(
+    origen: str, destino: Optional[str]
+) -> Tuple[Optional[Tuple[float, float, str]], Optional[Tuple[float, float, str]]]:
+    """
+    Si hay destino, geocodifica origen y destino en paralelo (Twilio corta webhooks ~15s).
+    """
+    if not GEOCODE_ENABLED or GEOCODE_PROVIDER != "nominatim":
+        return None, None
+    o = (origen or "").strip()
+    if not o:
+        return None, None
+    d = (destino or "").strip()
+    if not d:
+        return _nominatim_geocode(o), None
+
+    def _run(label: str, q: str) -> Optional[Tuple[float, float, str]]:
+        try:
+            return _nominatim_geocode(q)
+        except Exception as exc:
+            _log_exc("ERROR", f"geocode_parallel {label}", exc)
+            return None
+
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_o = ex.submit(_run, "origen", o)
+        f_d = ex.submit(_run, "destino", d)
+        try:
+            g_o = f_o.result(timeout=GEOCODE_TIMEOUT + 2.0)
+            g_d = f_d.result(timeout=GEOCODE_TIMEOUT + 2.0)
+        except FuturesTimeout:
+            _log("ERROR", "geocode_parallel timeout esperando Nominatim")
+            g_o = None
+            g_d = None
+    _log(
+        "GEOCODE",
+        "paralelo OK origen=%s destino=%s tiempo_ms=%.0f",
+        g_o is not None,
+        g_d is not None,
+        (time.perf_counter() - t0) * 1000.0,
+    )
+    return g_o, g_d
+
+
 def _extract_json_object(raw: str) -> dict:
     raw = (raw or "").strip()
     try:
@@ -411,15 +455,26 @@ Texto del usuario:
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
-            timeout=12.0,
+            timeout=8.0,
         )
         data = _extract_json_object(result.choices[0].message.content or "")
         o = data.get("origen")
         if o is None or str(o).strip().lower() in ("null", "none", ""):
-            return None, "No alcanzamos a entender bien el punto de recogida. ¿Nos lo repites, por favor?"
+            fb = (user_text or "").strip()
+            if len(fb) >= 4:
+                _log("OPENAI", "extract_pickup_address fallback texto usuario (origen vacío en JSON)")
+                return fb, ""
+            return None, (
+                "No alcanzamos a entender bien el punto de recogida. ¿Nos lo repites, por favor? "
+                "Intenta decir una calle, carrera, barrio o lugar conocido en Popayán."
+            )
         return str(o).strip(), ""
     except Exception as exc:
         _log_exc("OPENAI", "extract_pickup_address", exc)
+        fb = (user_text or "").strip()
+        if len(fb) >= 4:
+            _log("OPENAI", "extract_pickup_address fallback tras excepción OpenAI")
+            return fb, ""
         return None, "Hubo un problema técnico. Intenta decir de nuevo tu punto de recogida."
 
 
@@ -437,15 +492,22 @@ Texto:
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
-            timeout=12.0,
+            timeout=8.0,
         )
         data = _extract_json_object(result.choices[0].message.content or "")
         d = data.get("destino")
         if d is None or str(d).strip().lower() in ("null", "none", ""):
+            fb = (user_text or "").strip()
+            if len(fb) >= 3:
+                _log("OPENAI", "extract_destination_address fallback texto usuario")
+                return fb, ""
             return None, "¿Cuál es tu destino? Puedes decir calle, carrera, barrio o un lugar conocido en Popayán."
         return str(d).strip(), ""
     except Exception as exc:
         _log_exc("OPENAI", "extract_destination_address", exc)
+        fb = (user_text or "").strip()
+        if len(fb) >= 3:
+            return fb, ""
         return None, "Repite el destino, por favor."
 
 
@@ -491,25 +553,34 @@ def create_service_once(sess: CallSession, celular: Optional[str], origen: str, 
         _log("STATE", "Ignorando creación duplicada CallSid=%s", sess.call_sid)
         return True, MSG_CIERRE_OK
 
-    g_o = geocode_address(origen)
+    t0 = time.perf_counter()
+    dest_norm = destino.strip() if destino else None
+    g_o, g_d = geocode_origin_and_optional_destination(origen, dest_norm)
     if not g_o:
         return False, (
-            "No logramos ubicar ese punto dentro de Popayán. "
-            "Por favor repite la dirección o el barrio con un poco más de detalle."
+            "No logramos identificar esa dirección en este momento. "
+            "Por favor repite tu punto de recogida. Intenta decir una calle, carrera, barrio o lugar conocido en Popayán."
         )
 
     olat, olng, _ = g_o
     dlat, dlng = 0.0, 0.0
-    if destino and destino.strip():
-        g_d = geocode_address(destino)
+    if dest_norm:
         if not g_d:
             return False, (
-                "No encontramos ese destino en Popayán. "
+                "No encontramos ese destino en Popayán en este momento. "
                 "¿Puedes repetirlo indicando calle, carrera o un lugar conocido?"
             )
         dlat, dlng, _ = g_d
 
-    payload = build_payload(celular, origen, olat, olng, destino.strip() if destino else None, dlat, dlng)
+    _log(
+        "GEOCODE",
+        "create_service_once geocode_ms=%.0f origen_ok=%s dest_ok=%s",
+        (time.perf_counter() - t0) * 1000.0,
+        True,
+        bool(dest_norm and g_d),
+    )
+
+    payload = build_payload(celular, origen, olat, olng, dest_norm, dlat, dlng)
     if not post_solicitud_telefonica(payload):
         return False, (
             "No pudimos registrar tu solicitud en este momento. "
@@ -589,12 +660,21 @@ def voice():
         sess.state = STATE_WAITING_ORIGIN
 
     saludo = (
-        "Hola, ¿cómo estás? Bienvenido a nuestro asistente virtual. "
+        "Hola, Bienvenido soy tu asistente virtual. "
         "¿Desde dónde te podemos recoger hoy? "
-        "Puedes decirme una dirección, un barrio, o un lugar conocido en Popayán."
+        "Puedes decirme una dirección de recogida."
     )
     body, status, headers = twiml_gather_message(saludo)
     return body, status, headers
+
+
+def _speech_from_request() -> str:
+    """Twilio puede enviar el resultado bajo distintas claves según versión / Gather."""
+    for key in ("SpeechResult", "StableSpeechResult", "UnstableSpeechResult"):
+        v = (request.values.get(key) or "").strip()
+        if v:
+            return v
+    return ""
 
 
 @app.route("/process_speech", methods=["GET", "POST"])
@@ -602,11 +682,18 @@ def process_speech():
     call_sid = request.values.get("CallSid") or "unknown"
     caller_id = request.values.get("From", "").replace("whatsapp:", "")
     texto_crudo = request.values.get("SpeechResult", "") or ""
-    texto_usuario = texto_crudo.strip()
-
-    _log("SPEECH", "CallSid=%s SpeechResult len=%s", call_sid, len(texto_crudo))
-
+    texto_usuario = _speech_from_request()
     sess = get_session(call_sid)
+
+    _log(
+        "SPEECH",
+        "CallSid=%s estado=%s SpeechResult_len=%s texto_len=%s preview=%r",
+        call_sid,
+        sess.state,
+        len(texto_crudo),
+        len(texto_usuario),
+        (texto_usuario[:120] + "…") if len(texto_usuario) > 120 else texto_usuario,
+    )
 
     if sess.state == STATE_FINISHED or (sess.service_created and sess.state == STATE_SERVICE_CREATED):
         body, status, headers = twiml_say_hangup("Gracias por tu llamada. Hasta pronto.")
@@ -658,8 +745,13 @@ def process_speech():
 
     if sess.state == STATE_WAITING_ORIGIN:
         origen, hint = extract_pickup_address(texto_usuario)
+        _log("STATE", "waiting_origin extraído origen=%r hint_len=%s", origen, len(hint or ""))
         if not origen:
-            body, status, headers = twiml_gather_message(hint or "Cuéntanos, por favor, dónde te recogemos en Popayán.")
+            body, status, headers = twiml_gather_message(
+                hint
+                or "No logramos identificar esa dirección en este momento. ¿Podrías repetir tu punto de recogida? "
+                "Intenta decir una calle, carrera, barrio o lugar conocido en Popayán."
+            )
             return body, status, headers
 
         sess.origen_text = origen
@@ -699,8 +791,11 @@ def process_speech():
 
     if sess.state == STATE_WAITING_DESTINATION:
         dest, hint = extract_destination_address(texto_usuario)
+        _log("STATE", "waiting_destination extraído destino=%r", dest)
         if not dest:
-            body, status, headers = twiml_gather_message(hint or "¿Cuál es tu destino en Popayán?")
+            body, status, headers = twiml_gather_message(
+                hint or "No logramos entender el destino. ¿Podrías repetirlo? Di una calle, carrera, barrio o lugar conocido en Popayán."
+            )
             return body, status, headers
 
         sess.destino_text = dest
