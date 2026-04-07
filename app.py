@@ -13,7 +13,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 
 import requests
@@ -28,11 +28,333 @@ try:
 except ImportError:
     OpenAI = None
 
-from urban_address import (
-    UrbanAddressResult,
-    build_geocode_query_chain,
-    merge_urban_with_llm,
-)
+# ── Normalización calle/carrera (antes urban_address.py; inline para despliegue Render sin módulo extra) ─
+
+MatchTypeUrban = Literal["cruce", "nomenclatura", "via_parcial", "referencia_libre"]
+
+
+def _sanitize_match_type_urban(s: str) -> MatchTypeUrban:
+    if s in ("cruce", "nomenclatura", "via_parcial", "referencia_libre"):
+        return s  # type: ignore[return-value]
+    return "referencia_libre"
+
+
+@dataclass
+class UrbanAddressResult:
+    original_text: str = ""
+    normalized_text: str = ""
+    canonical: str = ""
+    match_type: MatchTypeUrban = "referencia_libre"
+    is_partial: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "original_text": self.original_text,
+            "normalized_text": self.normalized_text,
+            "canonical": self.canonical,
+            "match_type": self.match_type,
+            "is_partial": self.is_partial,
+        }
+
+    @staticmethod
+    def from_dict(d: Optional[Dict[str, Any]]) -> "UrbanAddressResult":
+        if not d:
+            return UrbanAddressResult()
+        return UrbanAddressResult(
+            original_text=str(d.get("original_text") or ""),
+            normalized_text=str(d.get("normalized_text") or ""),
+            canonical=str(d.get("canonical") or ""),
+            match_type=_sanitize_match_type_urban(str(d.get("match_type") or "referencia_libre")),
+            is_partial=bool(d.get("is_partial")),
+        )
+
+    @staticmethod
+    def empty() -> "UrbanAddressResult":
+        return UrbanAddressResult()
+
+
+_NUM_PART_URBAN = r"\d+[a-zA-ZáéíóúÁÉÍÓÚ°]*"
+
+
+def _collapse_spaces_urban(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _unify_hyphen_cruce_urban(s: str) -> str:
+    s = re.sub(r"\s*/\s*", " ", s)
+    s = re.sub(
+        rf"(calle\s+{_NUM_PART_URBAN})\s*-\s*(carrera\s+{_NUM_PART_URBAN})\b",
+        r"\1 \2",
+        s,
+        flags=re.I,
+    )
+    s = re.sub(
+        rf"(carrera\s+{_NUM_PART_URBAN})\s*-\s*(calle\s+{_NUM_PART_URBAN})\b",
+        r"\1 \2",
+        s,
+        flags=re.I,
+    )
+    return s
+
+
+def _expand_abbreviations_urban(s: str) -> str:
+    t = s.lower().strip()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"\bcalles\b", "calle", t)
+    t = re.sub(r"\bcarreras\b", "carrera", t)
+    t = re.sub(r"\bnúmero\b", "#", t)
+    t = re.sub(r"\bnumero\b", "#", t)
+    t = re.sub(r"\bnro\.?\b", "#", t)
+    t = re.sub(r"\bn°\b", "#", t)
+    t = re.sub(r"\bcl\.?\s+", "calle ", t)
+    t = re.sub(r"\bcra\.?\s+", "carrera ", t)
+    t = re.sub(r"\bkr\.?\s+", "carrera ", t)
+    t = re.sub(r"\bk\.?\s+", "carrera ", t)
+    t = re.sub(r"\bav\.?\s+", "avenida ", t)
+    t = re.sub(r"\bdg\.?\s+", "diagonal ", t)
+    t = re.sub(r"\btv\.?\s+", "transversal ", t)
+    t = re.sub(r"\bc\s+(\d)", r"calle \1", t)
+    t = re.sub(r"#\s*(\d+)\s+(\d+)\b", r"# \1-\2", t)
+    t = _unify_hyphen_cruce_urban(t)
+    return _collapse_spaces_urban(t)
+
+
+def _title_via_urban(word: str) -> str:
+    return word[:1].upper() + word[1:] if word else word
+
+
+def _canonical_cruce_urban(c: str, k: str) -> str:
+    return f"Calle {_title_via_urban(c)} con Carrera {_title_via_urban(k)}"
+
+
+def normalize_urban_address(raw: str) -> UrbanAddressResult:
+    original = (raw or "").strip()
+    if not original:
+        return UrbanAddressResult.empty()
+
+    expanded = _expand_abbreviations_urban(original)
+
+    m = re.search(
+        rf"calle\s+({_NUM_PART_URBAN})\s+(?:con|y|e)\s+carrera\s+({_NUM_PART_URBAN})",
+        expanded,
+        re.I,
+    )
+    if m:
+        c, k = m.group(1), m.group(2)
+        return UrbanAddressResult(
+            original_text=original,
+            normalized_text=expanded,
+            canonical=_canonical_cruce_urban(c, k),
+            match_type="cruce",
+            is_partial=False,
+        )
+
+    m = re.search(
+        rf"carrera\s+({_NUM_PART_URBAN})\s+(?:con|y|e)\s+calle\s+({_NUM_PART_URBAN})",
+        expanded,
+        re.I,
+    )
+    if m:
+        k, c = m.group(1), m.group(2)
+        return UrbanAddressResult(
+            original_text=original,
+            normalized_text=expanded,
+            canonical=_canonical_cruce_urban(c, k),
+            match_type="cruce",
+            is_partial=False,
+        )
+
+    m = re.search(
+        rf"entre\s+calle\s+({_NUM_PART_URBAN})\s+y\s+carrera\s+({_NUM_PART_URBAN})\b",
+        expanded,
+        re.I,
+    )
+    if m:
+        c, k = m.group(1), m.group(2)
+        return UrbanAddressResult(
+            original_text=original,
+            normalized_text=expanded,
+            canonical=_canonical_cruce_urban(c, k),
+            match_type="cruce",
+            is_partial=False,
+        )
+
+    m = re.search(
+        rf"entre\s+carrera\s+({_NUM_PART_URBAN})\s+y\s+calle\s+({_NUM_PART_URBAN})\b",
+        expanded,
+        re.I,
+    )
+    if m:
+        k, c = m.group(1), m.group(2)
+        return UrbanAddressResult(
+            original_text=original,
+            normalized_text=expanded,
+            canonical=_canonical_cruce_urban(c, k),
+            match_type="cruce",
+            is_partial=False,
+        )
+
+    m = re.search(
+        rf"calle\s+({_NUM_PART_URBAN})\s+esquina\s+carrera\s+({_NUM_PART_URBAN})\b",
+        expanded,
+        re.I,
+    )
+    if m:
+        c, k = m.group(1), m.group(2)
+        return UrbanAddressResult(
+            original_text=original,
+            normalized_text=expanded,
+            canonical=_canonical_cruce_urban(c, k),
+            match_type="cruce",
+            is_partial=False,
+        )
+
+    m = re.search(
+        rf"carrera\s+({_NUM_PART_URBAN})\s+esquina\s+calle\s+({_NUM_PART_URBAN})\b",
+        expanded,
+        re.I,
+    )
+    if m:
+        k, c = m.group(1), m.group(2)
+        return UrbanAddressResult(
+            original_text=original,
+            normalized_text=expanded,
+            canonical=_canonical_cruce_urban(c, k),
+            match_type="cruce",
+            is_partial=False,
+        )
+
+    m = re.search(
+        rf"calle\s+({_NUM_PART_URBAN})\s+carrera\s+({_NUM_PART_URBAN})\b",
+        expanded,
+        re.I,
+    )
+    if m:
+        c, k = m.group(1), m.group(2)
+        return UrbanAddressResult(
+            original_text=original,
+            normalized_text=expanded,
+            canonical=_canonical_cruce_urban(c, k),
+            match_type="cruce",
+            is_partial=False,
+        )
+
+    m = re.search(
+        rf"carrera\s+({_NUM_PART_URBAN})\s+calle\s+({_NUM_PART_URBAN})\b",
+        expanded,
+        re.I,
+    )
+    if m:
+        k, c = m.group(1), m.group(2)
+        return UrbanAddressResult(
+            original_text=original,
+            normalized_text=expanded,
+            canonical=_canonical_cruce_urban(c, k),
+            match_type="cruce",
+            is_partial=False,
+        )
+
+    m = re.search(
+        rf"(calle|carrera)\s+({_NUM_PART_URBAN})\s*#\s*(\d+)\s*[-–]?\s*(\d+)",
+        expanded,
+        re.I,
+    )
+    if m:
+        via, n1, p1, p2 = m.group(1), m.group(2), m.group(3), m.group(4)
+        via_t = "Calle" if via.lower() == "calle" else "Carrera"
+        canon = f"{via_t} {_title_via_urban(n1)} # {p1}-{p2}"
+        return UrbanAddressResult(
+            original_text=original,
+            normalized_text=expanded,
+            canonical=canon,
+            match_type="nomenclatura",
+            is_partial=False,
+        )
+
+    m = re.search(rf"\bcalle\s+({_NUM_PART_URBAN})(?:\s+(norte|sur|este|oeste))?\b", expanded, re.I)
+    if m and not re.search(r"calle\s+\d+.*(?:con|y|e)\s+carrera", expanded, re.I):
+        n = m.group(1)
+        ori = m.group(2)
+        tail = f" {ori}" if ori else ""
+        return UrbanAddressResult(
+            original_text=original,
+            normalized_text=expanded,
+            canonical=f"Calle {_title_via_urban(n)}{tail}",
+            match_type="via_parcial",
+            is_partial=True,
+        )
+
+    m = re.search(rf"\bcarrera\s+({_NUM_PART_URBAN})(?:\s+(norte|sur|este|oeste))?\b", expanded, re.I)
+    if m and not re.search(r"carrera\s+\d+.*(?:con|y|e)\s+calle", expanded, re.I):
+        n = m.group(1)
+        ori = m.group(2)
+        tail = f" {ori}" if ori else ""
+        return UrbanAddressResult(
+            original_text=original,
+            normalized_text=expanded,
+            canonical=f"Carrera {_title_via_urban(n)}{tail}",
+            match_type="via_parcial",
+            is_partial=True,
+        )
+
+    return UrbanAddressResult(
+        original_text=original,
+        normalized_text=expanded,
+        canonical=_collapse_spaces_urban(original)[:300],
+        match_type="referencia_libre",
+        is_partial=False,
+    )
+
+
+def merge_urban_with_llm(raw: str, llm_location: Optional[str]) -> UrbanAddressResult:
+    u_audio = normalize_urban_address(raw or "")
+    if u_audio.match_type in ("cruce", "nomenclatura", "via_parcial"):
+        return u_audio
+
+    u_llm = normalize_urban_address((llm_location or "").strip())
+    if u_llm.match_type in ("cruce", "nomenclatura", "via_parcial"):
+        u_llm.original_text = raw or u_llm.original_text
+        return u_llm
+
+    text = (llm_location or raw or "").strip()
+    if not text:
+        return UrbanAddressResult.empty()
+
+    return UrbanAddressResult(
+        original_text=raw,
+        normalized_text=u_audio.normalized_text or _collapse_spaces_urban((llm_location or raw or "").lower()),
+        canonical=text,
+        match_type="referencia_libre",
+        is_partial=False,
+    )
+
+
+def build_geocode_query_chain(urban: UrbanAddressResult, display_fallback: str) -> List[str]:
+    seen: set = set()
+    out: List[str] = []
+
+    def add(q: str) -> None:
+        q = _collapse_spaces_urban(q)
+        if not q or len(q) < 2:
+            return
+        key = q.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(q)
+
+    if urban.canonical:
+        add(urban.canonical)
+    if urban.normalized_text and urban.normalized_text != urban.canonical:
+        add(urban.normalized_text[:400])
+    if display_fallback and display_fallback.strip():
+        add(display_fallback.strip()[:400])
+    if urban.original_text and urban.original_text.strip():
+        add(urban.original_text.strip()[:400])
+    return out
+
 
 # ── Lógica pura (antes ia_phone_logic.py) ─────────────────────────────────────
 
