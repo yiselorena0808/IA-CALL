@@ -28,6 +28,12 @@ try:
 except ImportError:
     OpenAI = None
 
+from urban_address import (
+    UrbanAddressResult,
+    build_geocode_query_chain,
+    merge_urban_with_llm,
+)
+
 # ── Lógica pura (antes ia_phone_logic.py) ─────────────────────────────────────
 
 POPAYAN_MIN_LAT = float(os.getenv("POPAYAN_MIN_LAT", "2.32"))
@@ -180,6 +186,9 @@ class CallSession:
     service_created: bool = False
     silence_count: int = 0
     updated_at: float = field(default_factory=time.time)
+    # Metadatos dirección urbana (JSON-compatible para backend operador)
+    origen_ia: Optional[Dict[str, Any]] = None
+    destino_ia: Optional[Dict[str, Any]] = None
 
     def touch(self) -> None:
         self.updated_at = time.time()
@@ -446,6 +455,30 @@ def _nominatim_geocode(query: str) -> Optional[Tuple[float, float, str]]:
         return None
 
 
+def _city_short_label() -> str:
+    part = (GEOCODE_SUFFIX or "Popayán, Cauca, Colombia").split(",")[0].strip()
+    return part or "Popayán"
+
+
+def _display_label_urban(urban: UrbanAddressResult) -> str:
+    c = (urban.canonical or "").strip()
+    if not c:
+        return ""
+    return f"{c}, {_city_short_label()}"
+
+
+def _geocode_chain(queries: List[str]) -> Optional[Tuple[float, float, str]]:
+    for q in queries:
+        qq = (q or "").strip()
+        if len(qq) < 2:
+            continue
+        r = _nominatim_geocode(qq)
+        if r:
+            _log("GEOCODE", "cadena OK q=%r", qq[:220])
+            return r
+    return None
+
+
 def geocode_address(text: str) -> Optional[Tuple[float, float, str]]:
     if not GEOCODE_ENABLED or GEOCODE_PROVIDER != "nominatim":
         return None
@@ -453,11 +486,14 @@ def geocode_address(text: str) -> Optional[Tuple[float, float, str]]:
 
 
 def geocode_origin_and_optional_destination(
-    origen: str, destino: Optional[str]
+    origen: str,
+    destino: Optional[str],
+    origen_queries: Optional[List[str]] = None,
+    destino_queries: Optional[List[str]] = None,
 ) -> Tuple[Optional[Tuple[float, float, str]], Optional[Tuple[float, float, str]]]:
     """
     Geocodifica en serie: Nominatim público no admite peticiones paralelas (~1 req/s por IP).
-    El lock + intervalo en _nominatim_geocode evita 429; origen y destino se piden uno tras otro.
+    Cada pierna puede pasar varias variantes de texto (normalizada → parcial → libre).
     """
     if not GEOCODE_ENABLED or GEOCODE_PROVIDER != "nominatim":
         return None, None
@@ -465,13 +501,15 @@ def geocode_origin_and_optional_destination(
     if not o:
         return None, None
     d = (destino or "").strip()
+    o_q = origen_queries if origen_queries is not None else [o]
+    d_q = destino_queries if destino_queries is not None else ([d] if d else [])
     t0 = time.perf_counter()
     try:
-        g_o = _nominatim_geocode(o)
+        g_o = _geocode_chain(o_q)
         if not d:
             g_d = None
         else:
-            g_d = _nominatim_geocode(d)
+            g_d = _geocode_chain(d_q) if d_q else _nominatim_geocode(d)
     except Exception as exc:
         _log_exc("ERROR", "geocode origen/destino", exc)
         g_o, g_d = None, None
@@ -507,7 +545,9 @@ def extract_pickup_address(user_text: str) -> Tuple[Optional[str], str]:
     prompt = f"""Eres un asistente para taxi en Popayán, Cauca, Colombia.
 El usuario habla por teléfono. Extrae SOLO el punto de RECOGIDA (origen).
 Si dice "de X a Y", "desde X hasta Y" o "de X hacia Y", el origen es X (no Y).
-Barrios, Sena Norte/Sur, iglesias, centros comerciales, conjuntos y lugares comunes son válidos.
+Prioriza direcciones por calle y/o carrera: cruces (calle 5 con carrera 9, calle 5 carrera 9, entre calle X y carrera Y),
+nomenclatura con placa (carrera 6 # 12-34), una sola vía (calle 15, cl 25 norte, cra 8). Abreviaturas: cl, cra, kr, k.
+Barrios y lugares conocidos solo si no hay calle/carrera clara.
 Responde SOLO JSON: {{"origen": "texto normalizado o null", "nota": "breve"}}
 Si no hay ninguna ubicación clara, origen=null.
 Texto del usuario:
@@ -546,6 +586,9 @@ def extract_destination_address(user_text: str) -> Tuple[Optional[str], str]:
         t = (user_text or "").strip()
         return (t if len(t) > 2 else None, "Indica tu destino en Popayán, por favor.")
     prompt = f"""Popayán, Cauca, Colombia. Extrae SOLO la dirección o lugar de DESTINO del viaje.
+Prioriza calle y carrera: cruces (calle 5 con carrera 9, calle 5 carrera 9, entre calle X y carrera Y),
+placas (carrera 6 # 12-34), una vía (calle 15 norte). Abreviaturas: cl, cra, kr, k.
+Si no hay nomenclatura de vías, acepta lugar conocido o barrio.
 Responde SOLO JSON: {{"destino": "texto o null", "nota": "breve"}}
 Texto:
 {user_text}
@@ -582,6 +625,7 @@ def build_payload(
     destino: Optional[str],
     dlat: float,
     dlng: float,
+    ia_meta: Optional[Dict[str, Any]] = None,
 ) -> dict:
     payload: Dict[str, Any] = {
         "pasajero_id": 1,
@@ -601,6 +645,8 @@ def build_payload(
         payload["destino"] = ""
         payload["destino_lat"] = 0.0
         payload["destino_lng"] = 0.0
+    if ia_meta:
+        payload["ia_address_meta"] = json.dumps(ia_meta, ensure_ascii=False)
     return payload
 
 
@@ -618,22 +664,53 @@ def create_service_once(sess: CallSession, celular: Optional[str], origen: str, 
 
     t0 = time.perf_counter()
     dest_norm = destino.strip() if destino else None
-    g_o, g_d = geocode_origin_and_optional_destination(origen, dest_norm)
+    u_o = UrbanAddressResult.from_dict(sess.origen_ia or {})
+    u_d = UrbanAddressResult.from_dict(sess.destino_ia or {}) if dest_norm else UrbanAddressResult.empty()
+
+    q_o = build_geocode_query_chain(u_o, origen)
+    q_d = build_geocode_query_chain(u_d, dest_norm or "") if dest_norm else None
+
+    _log(
+        "ADDRESS",
+        "geocode entrada origen raw=%r norm=%r tipo=%s parcial=%s queries=%s",
+        u_o.original_text,
+        u_o.normalized_text,
+        u_o.match_type,
+        u_o.is_partial,
+        [x[:80] for x in q_o[:5]],
+    )
+    if dest_norm:
+        _log(
+            "ADDRESS",
+            "geocode entrada destino raw=%r norm=%r tipo=%s parcial=%s queries=%s",
+            u_d.original_text,
+            u_d.normalized_text,
+            u_d.match_type,
+            u_d.is_partial,
+            [x[:80] for x in (q_d or [])[:5]],
+        )
+
+    g_o, g_d = geocode_origin_and_optional_destination(origen, dest_norm, q_o, q_d if dest_norm else None)
     if not g_o:
+        _log("GEOCODE", "create_service_once origen sin resultado tras cadena")
         return False, (
             "No logramos identificar esa dirección en este momento. "
             "Por favor repite tu punto de recogida. Intenta decir una calle, carrera, barrio o lugar conocido en Popayán."
         )
 
-    olat, olng, _ = g_o
+    olat, olng, geo_o = g_o
+    _log("GEOCODE", "create_service_once origen hit display_name=%r", (geo_o or "")[:200])
     dlat, dlng = 0.0, 0.0
+    geo_d = ""
     if dest_norm:
         if not g_d:
+            _log("GEOCODE", "create_service_once destino sin resultado tras cadena")
             return False, (
                 "No encontramos ese destino en Popayán en este momento. "
                 "¿Puedes repetirlo indicando calle, carrera o un lugar conocido?"
             )
-        dlat, dlng, _ = g_d
+        dlat, dlng, geo_d = g_d
+        _log("GEOCODE", "create_service_once destino hit display_name=%r", (geo_d or "")[:200])
 
     _log(
         "GEOCODE",
@@ -643,7 +720,21 @@ def create_service_once(sess: CallSession, celular: Optional[str], origen: str, 
         bool(dest_norm and g_d),
     )
 
-    payload = build_payload(celular, origen, olat, olng, dest_norm, dlat, dlng)
+    ia_meta: Dict[str, Any] = {
+        "origen": {
+            **(sess.origen_ia or {}),
+            "display_label": _display_label_urban(u_o) or origen,
+            "geocoded_preview": (geo_o or "")[:300],
+        },
+    }
+    if dest_norm:
+        ia_meta["destino"] = {
+            **(sess.destino_ia or {}),
+            "display_label": _display_label_urban(u_d) or (dest_norm or ""),
+            "geocoded_preview": (geo_d or "")[:300],
+        }
+
+    payload = build_payload(celular, origen, olat, olng, dest_norm, dlat, dlng, ia_meta=ia_meta)
     if not post_solicitud_telefonica(payload):
         return False, (
             "No pudimos registrar tu solicitud en este momento. "
@@ -807,9 +898,25 @@ def process_speech():
     sess.silence_count = 0
 
     if sess.state == STATE_WAITING_ORIGIN:
-        origen, hint = extract_pickup_address(texto_usuario)
-        _log("STATE", "waiting_origin extraído origen=%r hint_len=%s", origen, len(hint or ""))
+        origen_llm, hint = extract_pickup_address(texto_usuario)
+        urban_o = merge_urban_with_llm(texto_usuario, origen_llm)
+        origen = (urban_o.canonical or (origen_llm or "").strip() or "").strip()
         if not origen:
+            origen = (texto_usuario or "").strip()
+        sess.origen_ia = urban_o.to_dict()
+        sess.origen_text = origen
+        _log(
+            "ADDRESS",
+            "waiting_origin raw=%r norm=%r tipo=%s parcial=%s canon=%r display=%r",
+            urban_o.original_text,
+            urban_o.normalized_text,
+            urban_o.match_type,
+            urban_o.is_partial,
+            urban_o.canonical,
+            _display_label_urban(urban_o),
+        )
+        _log("STATE", "waiting_origin extraído origen=%r hint_len=%s", origen, len(hint or ""))
+        if not origen or len(origen) < 2:
             body, status, headers = twiml_gather_message(
                 hint
                 or "No logramos identificar esa dirección en este momento. ¿Podrías repetir tu punto de recogida? "
@@ -817,7 +924,6 @@ def process_speech():
             )
             return body, status, headers
 
-        sess.origen_text = origen
         sess.state = STATE_WAITING_DEST_DECISION
         msg = (
             "Perfecto. ¿Deseas indicarnos también tu destino final? "
@@ -853,15 +959,30 @@ def process_speech():
         return body, status, headers
 
     if sess.state == STATE_WAITING_DESTINATION:
-        dest, hint = extract_destination_address(texto_usuario)
-        _log("STATE", "waiting_destination extraído destino=%r", dest)
+        dest_llm, hint = extract_destination_address(texto_usuario)
+        urban_d = merge_urban_with_llm(texto_usuario, dest_llm)
+        dest = (urban_d.canonical or (dest_llm or "").strip() or "").strip()
         if not dest:
+            dest = (texto_usuario or "").strip()
+        sess.destino_ia = urban_d.to_dict()
+        sess.destino_text = dest
+        _log(
+            "ADDRESS",
+            "waiting_destination raw=%r norm=%r tipo=%s parcial=%s canon=%r display=%r",
+            urban_d.original_text,
+            urban_d.normalized_text,
+            urban_d.match_type,
+            urban_d.is_partial,
+            urban_d.canonical,
+            _display_label_urban(urban_d),
+        )
+        _log("STATE", "waiting_destination extraído destino=%r", dest)
+        if not dest or len(dest) < 2:
             body, status, headers = twiml_gather_message(
                 hint or "No logramos entender el destino. ¿Podrías repetirlo? Di una calle, carrera, barrio o lugar conocido en Popayán."
             )
             return body, status, headers
 
-        sess.destino_text = dest
         ok, closing = create_service_once(sess, caller_id, sess.origen_text or "", dest)
         if not ok:
             body, status, headers = twiml_gather_message(closing)
